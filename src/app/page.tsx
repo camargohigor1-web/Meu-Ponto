@@ -1121,7 +1121,7 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, dark }: 
                       {item.pos?"+ ":"- "}R$ {Number(item.v).toLocaleString("pt-BR",{minimumFractionDigits:2})}
                     </span>
                   </div>
-                  {item.obs && <p className="text-xs text-slate-500 italic mt-0.5">"{item.obs}"</p>}
+                  {item.obs && <p className="text-xs text-slate-500 italic mt-0.5">'{item.obs}'</p>}
                 </div>
               ))}
               <div className={`flex justify-between py-3 px-3 rounded-xl mt-2 ${dark?"bg-slate-700/50":"bg-slate-100"}`}>
@@ -1364,7 +1364,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
                     </div>
                     {s!==null && <span className={`font-mono text-sm font-bold ${s>=0?"text-emerald-400":"text-red-400"}`}>{minToHHMM(s)}</span>}
                   </div>
-                  {r.observacao && <p className="text-xs text-slate-400 mt-1 italic">"{r.observacao}"</p>}
+                  {r.observacao && <p className="text-xs text-slate-400 mt-1 italic">'{r.observacao}'</p>}
                   {r.ausencia && <Badge color={r.ausencia==="falta"?"red":r.ausencia==="atestado"?"yellow":"blue"}>{r.ausencia}</Badge>}
                 </div>
               );
@@ -1430,7 +1430,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
                           );
                         })}
                       </div>
-                      {r.observacao && <p className="text-xs text-slate-400 mt-2 italic">"{r.observacao}"</p>}
+                     {r.observacao && <p className="text-xs text-slate-400 mt-2 italic">'{r.observacao}'</p>}
                     </div>
                   );
                 })}
