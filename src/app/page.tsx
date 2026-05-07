@@ -555,13 +555,20 @@ function TelaPonto({ config, registros, setRegistros, periodos, dark }: {
 // ============================================================
 // TELA: INÍCIO / DASHBOARD
 // ============================================================
-function TelaInicio({ config, registros, dark }: {
-  config: Config; registros: Record<string,RegistroDia>; dark: boolean;
+function TelaInicio({ config, registros, setRegistros, dark }: {
+  config: Config;
+  registros: Record<string,RegistroDia>;
+  setRegistros: React.Dispatch<React.SetStateAction<Record<string,RegistroDia>>>;
+  dark: boolean;
 }) {
   const [hora, setHora] = useState<Date|null>(null);
   const [calAno, setCalAno] = useState(()=>new Date().getFullYear());
   const [calMes, setCalMes] = useState(()=>new Date().getMonth());
   const [diaSel, setDiaSel] = useState<string|null>(null);
+  const [modoEdicaoCal, setModoEdicaoCal] = useState(false);
+  const [regEdicao, setRegEdicao] = useState<RegistroDia>({batidas:[null,null,null,null],editado:[false,false,false,false],ausencia:"",observacao:""});
+  const [editBatidaIdx, setEditBatidaIdx] = useState<number|null>(null);
+  const [editBatidaVal, setEditBatidaVal] = useState("");
 
   useEffect(()=>{
     setHora(new Date());
@@ -697,51 +704,169 @@ function TelaInicio({ config, registros, dark }: {
         </div>
       </Card>
 
-      {/* Modal dia selecionado */}
+      {/* Modal dia selecionado — popup centralizado */}
       {diaSel && (
-        <div className="fixed inset-0 z-50 bg-black/70 flex items-end justify-center p-0 sm:items-center sm:p-4">
-          <div className={`w-full max-w-sm rounded-t-3xl sm:rounded-2xl p-6 space-y-4 max-h-[80vh] overflow-y-auto ${dark?"bg-slate-800 border border-slate-700":"bg-white"}`}>
-            <div className="flex justify-between items-center">
+        <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4"
+          onClick={()=>{setDiaSel(null);setModoEdicaoCal(false);}}>
+          <div className={`w-full max-w-sm rounded-2xl shadow-2xl overflow-hidden ${dark?"bg-slate-800 border border-slate-700":"bg-white border border-slate-200"}`}
+            onClick={e=>e.stopPropagation()}>
+
+            {/* Header */}
+            <div className={`px-5 py-4 border-b flex justify-between items-center ${dark?"border-slate-700":"border-slate-200"}`}>
               <div>
-                <h3 className={`font-bold ${dark?"text-white":"text-slate-800"}`}>{formatarData(diaSel)}</h3>
-                <p className="text-xs text-slate-400">{DIAS_SEMANA[strParaData(diaSel).getDay()]} {feriados[diaSel]?`· 🔵 ${feriados[diaSel]}`:""}</p>
+                <h3 className={`font-bold text-base ${dark?"text-white":"text-slate-800"}`}>{formatarData(diaSel)}</h3>
+                <p className="text-xs text-slate-400">
+                  {DIAS_SEMANA[strParaData(diaSel).getDay()]}
+                  {feriados[diaSel] ? ` · 🔵 ${feriados[diaSel]}` : ""}
+                </p>
               </div>
-              <button onClick={()=>setDiaSel(null)} className="p-2 rounded-xl hover:bg-slate-700/50 text-slate-400">
+              <button onClick={()=>{setDiaSel(null);setModoEdicaoCal(false);}}
+                className="p-2 rounded-xl hover:bg-slate-700/50 text-slate-400 hover:text-white transition-colors">
                 <Ic n="x" size={18}/>
               </button>
             </div>
-            {(() => {
-              const r=registros[diaSel];
-              if(!r) return <p className="text-slate-400 text-sm text-center py-4">Sem registros para este dia.</p>;
-              const s=calcSaldo(r.batidas,config.escala);
-              return (
-                <div className="space-y-3">
-                  <div className="grid grid-cols-2 gap-2">
+
+            {/* Conteúdo scrollável */}
+            <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
+              {!modoEdicaoCal ? (
+                // Modo visualização
+                <>
+                  {(() => {
+                    const r = registros[diaSel];
+                    const s = r ? calcSaldo(r.batidas, config.escala) : null;
+                    return (
+                      <div className="space-y-3">
+                        {/* Batidas */}
+                        <div className="grid grid-cols-2 gap-2">
+                          {NOMES_BATIDAS.map((nome,i)=>(
+                            <div key={i} className={`p-3 rounded-xl ${dark?"bg-slate-700/50":"bg-slate-100"}`}>
+                              <p className="text-xs text-slate-400 mb-1">{nome}</p>
+                              <p className={`font-mono font-bold text-sm ${r?.batidas[i]?(dark?"text-blue-300":"text-blue-600"):"text-slate-500"}`}>
+                                {r?.batidas[i]||"--:--"}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                        {/* Saldo */}
+                        {s!==null && (
+                          <div className={`flex justify-between p-3 rounded-xl ${s>=0?"bg-emerald-500/10 border border-emerald-500/20":"bg-red-500/10 border border-red-500/20"}`}>
+                            <span className="text-sm text-slate-400">Saldo do dia</span>
+                            <span className={`font-mono font-bold ${s>=0?"text-emerald-400":"text-red-400"}`}>{minToHHMM(s)}</span>
+                          </div>
+                        )}
+                        {/* Ausência */}
+                        {r?.ausencia && (
+                          <Badge color={r.ausencia==="falta"?"red":r.ausencia==="atestado"?"yellow":"blue"}>
+                            {r.ausencia}
+                          </Badge>
+                        )}
+                        {/* Observação */}
+                        {r?.observacao && (
+                          <div className={`p-3 rounded-xl ${dark?"bg-slate-700/30":"bg-slate-100"}`}>
+                            <p className="text-xs text-slate-400 mb-1">Observação</p>
+                            <p className="text-sm text-slate-300">{r.observacao}</p>
+                          </div>
+                        )}
+                        {!r && (
+                          <p className="text-slate-500 text-sm text-center py-2">Nenhum registro para este dia.</p>
+                        )}
+                      </div>
+                    );
+                  })()}
+                  {/* Botão editar/inserir */}
+                  <Btn cls="w-full" v="secondary" sz="sm" onClick={()=>{
+                    const r = registros[diaSel];
+                    setRegEdicao(r ? {...r} : {batidas:[null,null,null,null],editado:[false,false,false,false],ausencia:"",observacao:""});
+                    setModoEdicaoCal(true);
+                  }}>
+                    <Ic n="edit" size={14}/>
+                    {registros[diaSel] ? "Editar registro" : "Inserir registro"}
+                  </Btn>
+                </>
+              ) : (
+                // Modo edição
+                <div className="space-y-4">
+                  <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">Editando marcações</p>
+                  {/* Batidas */}
+                  <div className="space-y-2">
                     {NOMES_BATIDAS.map((nome,i)=>(
-                      <div key={i} className={`p-3 rounded-xl ${dark?"bg-slate-700/50":"bg-slate-100"}`}>
-                        <p className="text-xs text-slate-400 mb-1">{nome}</p>
-                        <p className={`font-mono font-bold text-sm ${r.batidas[i]?(dark?"text-blue-300":"text-blue-600"):"text-slate-500"}`}>
-                          {r.batidas[i]||"--:--"}
-                        </p>
+                      <div key={i} className={`flex items-center justify-between p-3 rounded-xl ${dark?"bg-slate-700/40":"bg-slate-100"}`}>
+                        <div>
+                          <p className={`text-sm font-medium ${dark?"text-white":"text-slate-700"}`}>{nome}</p>
+                          <p className={`font-mono text-sm mt-0.5 ${regEdicao.batidas[i]?(dark?"text-blue-300":"text-blue-600"):"text-slate-500"}`}>
+                            {regEdicao.batidas[i] || "--:--"}
+                          </p>
+                        </div>
+                        <div className="flex gap-2">
+                          <button onClick={()=>{setEditBatidaIdx(i);setEditBatidaVal(regEdicao.batidas[i]||"");}}
+                            className="p-1.5 rounded-lg text-slate-400 hover:text-blue-400 transition-colors">
+                            <Ic n="edit" size={14}/>
+                          </button>
+                          {regEdicao.batidas[i] && (
+                            <button onClick={()=>{
+                              const novas=[...regEdicao.batidas]; novas[i]=null;
+                              setRegEdicao(p=>({...p,batidas:novas}));
+                            }} className="p-1.5 rounded-lg text-slate-400 hover:text-red-400 transition-colors">
+                              <Ic n="trash" size={14}/>
+                            </button>
+                          )}
+                        </div>
                       </div>
                     ))}
                   </div>
-                  {s!==null && (
-                    <div className={`flex justify-between p-3 rounded-xl ${s>=0?"bg-emerald-500/10 border border-emerald-500/20":"bg-red-500/10 border border-red-500/20"}`}>
-                      <span className="text-sm text-slate-300">Saldo</span>
-                      <span className={`font-mono font-bold ${s>=0?"text-emerald-400":"text-red-400"}`}>{minToHHMM(s)}</span>
-                    </div>
-                  )}
-                  {r.ausencia && <Badge color={r.ausencia==="falta"?"red":r.ausencia==="atestado"?"yellow":"blue"}>{r.ausencia}</Badge>}
-                  {r.observacao && (
-                    <div className={`p-3 rounded-xl ${dark?"bg-slate-700/30":"bg-slate-100"}`}>
-                      <p className="text-xs text-slate-400 mb-1">Observação</p>
-                      <p className="text-sm text-slate-300">{r.observacao}</p>
-                    </div>
-                  )}
+                  {/* Ausência */}
+                  <Sel label="Ausência" value={regEdicao.ausencia||""}
+                    onChange={v=>setRegEdicao(p=>({...p,ausencia:v}))}
+                    opts={[
+                      {value:"",label:"Nenhuma"},
+                      {value:"falta",label:"❌ Falta injustificada"},
+                      {value:"atestado",label:"🟡 Atestado médico"},
+                      {value:"feriado",label:"🔵 Feriado"},
+                      {value:"ferias",label:"🏖️ Férias"},
+                      {value:"folga",label:"🔄 Folga compensada"},
+                    ]}
+                  />
+                  {/* Observação */}
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-slate-400 uppercase tracking-wide">Observação</label>
+                    <textarea value={regEdicao.observacao||""} onChange={e=>setRegEdicao(p=>({...p,observacao:e.target.value}))}
+                      placeholder="Anotações sobre o dia..." rows={2}
+                      className="bg-slate-800/50 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 resize-none transition-all"/>
+                  </div>
+                  {/* Botões */}
+                  <div className="flex gap-3">
+                    <Btn v="secondary" cls="flex-1" sz="sm" onClick={()=>setModoEdicaoCal(false)}>Cancelar</Btn>
+                    <Btn v="success" cls="flex-1" sz="sm" onClick={()=>{
+                      setRegistros(prev=>({...prev,[diaSel]:regEdicao}));
+                      setModoEdicaoCal(false);
+                    }}>
+                      <Ic n="check" size={14}/>Salvar
+                    </Btn>
+                  </div>
                 </div>
-              );
-            })()}
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal editar batida individual */}
+      {editBatidaIdx!==null && (
+        <div className="fixed inset-0 z-[60] bg-black/70 flex items-center justify-center p-4">
+          <div className={`w-full max-w-xs rounded-2xl p-6 space-y-4 ${dark?"bg-slate-800 border border-slate-700":"bg-white"}`}>
+            <h3 className={`font-bold ${dark?"text-white":"text-slate-800"}`}>
+              {NOMES_BATIDAS[editBatidaIdx]}
+            </h3>
+            <Inp label="Horário" type="time" value={editBatidaVal} onChange={setEditBatidaVal}/>
+            <div className="flex gap-3">
+              <Btn cls="flex-1" onClick={()=>{
+                const novas=[...regEdicao.batidas]; novas[editBatidaIdx]=editBatidaVal;
+                const edit=[...regEdicao.editado]; edit[editBatidaIdx]=true;
+                setRegEdicao(p=>({...p,batidas:novas,editado:edit}));
+                setEditBatidaIdx(null);
+              }}>Salvar</Btn>
+              <Btn v="secondary" cls="flex-1" onClick={()=>setEditBatidaIdx(null)}>Cancelar</Btn>
+            </div>
           </div>
         </div>
       )}
@@ -1945,7 +2070,7 @@ export default function MeuPonto() {
 
       {/* Conteúdo principal */}
       <main className="max-w-lg mx-auto px-4 pt-5 pb-24 relative">
-        {aba==="inicio" && <TelaInicio config={config} registros={registros} dark={dark}/>}
+        {aba==="inicio" && <TelaInicio config={config} registros={registros} setRegistros={setRegistros} dark={dark}/>}
         {aba==="ponto" && <TelaPonto config={config} registros={registros} setRegistros={setRegistros} periodos={periodos} dark={dark}/>}
         {aba==="financeiro" && <TelaFinanceiro config={config} registros={registros} financeiro={financeiro} setFinanceiro={setFinanceiro} dark={dark}/>}
         {aba==="relatorio" && <TelaRelatorio config={config} registros={registros} setRegistros={setRegistros} periodos={periodos} setPeriodos={setPeriodos} dark={dark}/>}
