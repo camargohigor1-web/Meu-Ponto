@@ -945,8 +945,8 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, dark }: 
               <ResponsiveContainer width="100%" height={180}>
                 <LineChart data={dadosLinha}>
                   <XAxis dataKey="mes" stroke="#64748b" fontSize={10}/>
-                  <YAxis stroke="#64748b" fontSize={10} tickFormatter={v=>`R$${(v/1000).toFixed(1)}k`}/>
-                  <Tooltip formatter={(v:number)=>`R$ ${v.toLocaleString("pt-BR",{minimumFractionDigits:2})}`} contentStyle={{background:"#1e293b",border:"1px solid #334155",borderRadius:12}}/>
+                  <YAxis stroke="#64748b" fontSize={10} tickFormatter={(v:unknown)=>`R$${(Number(v)/1000).toFixed(1)}k`}/>
+                  <Tooltip formatter={(v:unknown)=>`R$ ${Number(v).toLocaleString("pt-BR",{minimumFractionDigits:2})}`} contentStyle={{background:"#1e293b",border:"1px solid #334155",borderRadius:12}}/>
                   <Line type="monotone" dataKey="liquido" stroke="#10b981" strokeWidth={2} dot={{fill:"#10b981",r:4}}/>
                 </LineChart>
               </ResponsiveContainer>
@@ -960,7 +960,7 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, dark }: 
                   <Pie data={dadosPizza} cx={65} cy={65} innerRadius={40} outerRadius={65} dataKey="value">
                     {dadosPizza.map((_,i)=><Cell key={i} fill={CORES[i]}/>)}
                   </Pie>
-                  <Tooltip formatter={(v:number)=>`R$ ${v.toLocaleString("pt-BR",{minimumFractionDigits:2})}`} contentStyle={{background:"#1e293b",border:"1px solid #334155",borderRadius:12}}/>
+                  <Tooltip formatter={(v:unknown)=>`R$ ${Number(v).toLocaleString("pt-BR",{minimumFractionDigits:2})}`} contentStyle={{background:"#1e293b",border:"1px solid #334155",borderRadius:12}}/>
                 </PieChart>
               </ResponsiveContainer>
               <div className="space-y-2 flex-1">
@@ -979,8 +979,8 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, dark }: 
             <ResponsiveContainer width="100%" height={160}>
               <BarChart data={dadosBH}>
                 <XAxis dataKey="mes" stroke="#64748b" fontSize={10}/>
-                <YAxis stroke="#64748b" fontSize={10} tickFormatter={v=>`${v}h`}/>
-                <Tooltip formatter={(v:number)=>`${v}h`} contentStyle={{background:"#1e293b",border:"1px solid #334155",borderRadius:12}}/>
+                <YAxis stroke="#64748b" fontSize={10} tickFormatter={(v:unknown)=>`${Number(v)}h`}/>
+                <Tooltip formatter={(v:unknown)=>`${Number(v)}h`} contentStyle={{background:"#1e293b",border:"1px solid #334155",borderRadius:12}}/>
                 <Bar dataKey="saldo" radius={[4,4,0,0]}>
                   {dadosBH.map((d,i)=><Cell key={i} fill={d.saldo>=0?"#10b981":"#ef4444"}/>)}
                 </Bar>
