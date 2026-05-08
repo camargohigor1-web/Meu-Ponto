@@ -17,7 +17,7 @@ interface RegistroDia {
   observacao: string;
   rhDivergencias?: (string | null)[];
 }
-interface Periodo { id: string; inicio: string; fim: string; fechado: boolean; }
+interface Periodo { id: string; inicio: string; fim: string; fechado: boolean; horaExtraRH?: string; }
 interface Recebimento {
   id: number;
   dataRecebimento: string;
@@ -169,12 +169,31 @@ function formatarData(s: string): string {
   const [y,m,d] = s.split("-");
   return `${d}/${m}/${y}`;
 }
-function calcSaldo(batidas: (string|null)[], escala: Config["escala"]): number | null {
+function minutosPrevistos(escala: Config["escala"]): number {
+  return (parseHHMM(escala.saida)-parseHHMM(escala.voltaAlmoco))+(parseHHMM(escala.saidaAlmoco)-parseHHMM(escala.entrada));
+}
+function calcSaldoBruto(batidas: (string|null)[], escala: Config["escala"]): number | null {
   const [e,sa,va,s] = batidas;
   if (!e||!sa||!va||!s) return null;
   const trab = (parseHHMM(s)-parseHHMM(va))+(parseHHMM(sa)-parseHHMM(e));
-  const prev = (parseHHMM(escala.saida)-parseHHMM(escala.voltaAlmoco))+(parseHHMM(escala.saidaAlmoco)-parseHHMM(escala.entrada));
-  return trab - prev;
+  return trab - minutosPrevistos(escala);
+}
+function calcSaldo(batidas: (string|null)[], config: Config): number | null {
+  const [e,sa,va,s] = batidas;
+  if (!e||!sa||!va||!s) return null;
+  const padroes = [config.escala.entrada, config.escala.saidaAlmoco, config.escala.voltaAlmoco, config.escala.saida];
+  const tolerancia = Math.max(0, Number(config.tolerancia)||0);
+  if (config.toleranciaTipo === "marcacao") {
+    const ajustadas = batidas.map((b,i) => {
+      if (!b) return b;
+      const diff = parseHHMM(b) - parseHHMM(padroes[i]);
+      return Math.abs(diff) <= tolerancia ? padroes[i] : b;
+    });
+    return calcSaldoBruto(ajustadas, config.escala);
+  }
+  const bruto = calcSaldoBruto(batidas, config.escala);
+  if (bruto === null) return null;
+  return Math.abs(bruto) <= tolerancia ? 0 : bruto;
 }
 function strParaData(s: string): Date {
   const [y,m,d] = s.split("-").map(Number);
@@ -185,6 +204,82 @@ function dataParaStr(d: Date): string {
 }
 function addDiasStr(s: string, n: number): string {
   const d = strParaData(s); d.setDate(d.getDate()+n); return dataParaStr(d);
+}
+function periodoFechamento(dataRef: string, fechamentoDia: number): {inicio:string; fim:string} {
+  const base = strParaData(dataRef);
+  const dia = Math.max(1, Math.min(28, Number(fechamentoDia)||25));
+  const fim = new Date(base.getFullYear(), base.getMonth(), dia);
+  if (base.getDate() > dia) fim.setMonth(fim.getMonth()+1);
+  const inicio = new Date(fim.getFullYear(), fim.getMonth()-1, dia+1);
+  return {inicio:dataParaStr(inicio), fim:dataParaStr(fim)};
+}
+function periodoMes(ano: number, mes: number): {inicio:string; fim:string} {
+  return {
+    inicio: dataParaStr(new Date(ano, mes, 1)),
+    fim: dataParaStr(new Date(ano, mes+1, 0)),
+  };
+}
+function entreDatas(data: string, inicio?: string, fim?: string): boolean {
+  return (!inicio || data >= inicio) && (!fim || data <= fim);
+}
+function listarDias(inicio: string, fim: string, somenteComRegistro = false, registros: Record<string,RegistroDia> = {}): string[] {
+  const dias: string[] = [];
+  if (!inicio || !fim) return dias;
+  let d = inicio;
+  while (d <= fim) {
+    if (!somenteComRegistro || registros[d]) dias.push(d);
+    d = addDiasStr(d, 1);
+  }
+  return dias;
+}
+function resumoRegistros(dias: string[], registros: Record<string,RegistroDia>, config: Config) {
+  return dias.reduce((acc, dia) => {
+    const r = registros[dia];
+    if (!r) return acc;
+    const bruto = calcSaldoBruto(r.batidas, config.escala);
+    const considerado = calcSaldo(r.batidas, config);
+    if (bruto !== null) acc.bruto += bruto;
+    if (considerado !== null) {
+      acc.considerado += considerado;
+      acc.extras += Math.max(0, considerado);
+      acc.negativas += Math.min(0, considerado);
+      acc.diasComPonto++;
+    }
+    if (r.ausencia === "falta") acc.faltas++;
+    if (r.ausencia === "atestado") acc.atestados++;
+    return acc;
+  }, {bruto:0, considerado:0, extras:0, negativas:0, faltas:0, atestados:0, diasComPonto:0});
+}
+function salarioLiquido(config: Config): number {
+  const bruto = Number(config.salarioBruto)||0;
+  const inss = calcINSS(bruto);
+  const irrf = calcIRRF(bruto,inss);
+  return bruto - inss - irrf;
+}
+function valorHoraLiquida(config: Config): number {
+  const liq = salarioLiquido(config);
+  return liq > 0 ? liq / 220 : 0;
+}
+function valorHoraExtra(minutos: number, config: Config): number {
+  const horas = Math.max(0, minutos) / 60;
+  return horas * valorHoraLiquida(config) * (1 + (Number(config.adicionalHE)||0)/100);
+}
+function horasExtrasFinanceiras(periodos: Periodo[] = [], registros: Record<string,RegistroDia>, config: Config, inicio?: string, fim?: string): number {
+  let total = 0;
+  const fechados = periodos.filter(p=>p.fechado && (!inicio || p.fim >= inicio) && (!fim || p.inicio <= fim));
+  fechados.forEach(p=>{
+    if (p.horaExtraRH) {
+      total += Math.max(0, Number(p.horaExtraRH)||0) * 60;
+      return;
+    }
+    const dias = listarDias(p.inicio, p.fim, true, registros).filter(d=>entreDatas(d,inicio,fim));
+    total += resumoRegistros(dias, registros, config).extras;
+  });
+  const diasAbertos = Object.keys(registros).filter(d=>
+    entreDatas(d,inicio,fim) && !fechados.some(p=>d>=p.inicio&&d<=p.fim)
+  );
+  total += resumoRegistros(diasAbertos, registros, config).extras;
+  return total;
 }
 
 function useLocalStorage<T>(key: string, init: T): [T, React.Dispatch<React.SetStateAction<T>>] {
@@ -333,7 +428,7 @@ function TelaPonto({ config, registros, setRegistros, periodos, dark }: {
   const reg = registros[diaAtual] || { batidas:[null,null,null,null], editado:[false,false,false,false], ausencia:"", observacao:"" };
   const padroes = [config.escala.entrada, config.escala.saidaAlmoco, config.escala.voltaAlmoco, config.escala.saida];
   const proxIdx = reg.batidas.findIndex(b=>!b);
-  const saldo = calcSaldo(reg.batidas, config.escala);
+  const saldo = calcSaldo(reg.batidas, config);
   const podeBater = ehHoje && (modoEdicao || ehHoje);
   const podeEditar = modoEdicao || ehHoje;
 
@@ -555,11 +650,12 @@ function TelaPonto({ config, registros, setRegistros, periodos, dark }: {
 // ============================================================
 // TELA: INÍCIO / DASHBOARD
 // ============================================================
-function TelaInicio({ config, registros, setRegistros, dark }: {
+function TelaInicio({ config, registros, setRegistros, dark, abrirRelatorioPeriodo }: {
   config: Config;
   registros: Record<string,RegistroDia>;
   setRegistros: React.Dispatch<React.SetStateAction<Record<string,RegistroDia>>>;
   dark: boolean;
+  abrirRelatorioPeriodo: (inicio: string, fim: string) => void;
 }) {
   const [hora, setHora] = useState<Date|null>(null);
   const [calAno, setCalAno] = useState(()=>new Date().getFullYear());
@@ -591,22 +687,14 @@ function TelaInicio({ config, registros, setRegistros, dark }: {
   });
   const saldoSemana = diasSemana.reduce((acc,dia)=>{
     const r=registros[dia]; if(!r) return acc;
-    return acc+(calcSaldo(r.batidas,config.escala)||0);
+    return acc+(calcSaldo(r.batidas, config)||0);
   },0);
 
-  // Horas trabalhadas no mês
-  const anoAtual=hoje_d.getFullYear(), mesAtual=hoje_d.getMonth();
-  const diasMesAtual=new Date(anoAtual,mesAtual+1,0).getDate();
-  let minMes=0, diasTrabMes=0;
-  for(let d=1;d<=diasMesAtual;d++){
-    const str=`${anoAtual}-${String(mesAtual+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
-    const r=registros[str]; if(!r) continue;
-    const s=calcSaldo(r.batidas,config.escala);
-    if(s!==null){minMes+=s; diasTrabMes++;}
-  }
-  const previsto=(parseHHMM(config.escala.saida)-parseHHMM(config.escala.voltaAlmoco))+(parseHHMM(config.escala.saidaAlmoco)-parseHHMM(config.escala.entrada));
-  const totalMinMes=diasTrabMes*previsto+minMes;
-  const liquidoPorHora=totalMinMes>0?liquido/(totalMinMes/60):0;
+  const periodoAtual = periodoFechamento(hoje, config.fechamentoDia);
+  const diasPeriodoAtual = listarDias(periodoAtual.inicio, periodoAtual.fim, true, registros);
+  const resumoPeriodoAtual = resumoRegistros(diasPeriodoAtual, registros, config);
+  const minPeriodo = resumoPeriodoAtual.considerado;
+  const liquidoPorHora=valorHoraLiquida(config);
 
   // Calendário
   const primeiroDia=new Date(calAno,calMes,1).getDay();
@@ -622,7 +710,7 @@ function TelaInicio({ config, registros, setRegistros, dark }: {
     if(r.ausencia==="ferias") return {emoji:"🏖️",cor:""};
     if(r.ausencia==="falta") return {emoji:"❌",cor:"text-red-400"};
     if(r.ausencia==="feriado") return {emoji:"🔵",cor:"text-blue-400"};
-    if(calcSaldo(r.batidas,config.escala)!==null) return {emoji:"✅",cor:"text-emerald-400"};
+    if(calcSaldo(r.batidas, config)!==null) return {emoji:"✅",cor:"text-emerald-400"};
     return null;
   }
 
@@ -654,7 +742,7 @@ function TelaInicio({ config, registros, setRegistros, dark }: {
           {label:"Saldo Semana", value:minToHHMM(saldoSemana), color:saldoSemana>=0?"text-emerald-400":"text-red-400", icon:"trending"},
           {label:"Salário Líquido", value:bruto?`R$ ${liquido.toLocaleString("pt-BR",{minimumFractionDigits:2})}`:"—", color:dark?"text-white":"text-slate-800", icon:"dollar"},
           {label:"Líquido / Hora", value:liquidoPorHora>0?`R$ ${liquidoPorHora.toLocaleString("pt-BR",{minimumFractionDigits:2})}`:"—", color:"text-blue-400", icon:"clock"},
-          {label:"Saldo Mês", value:minToHHMM(minMes), color:minMes>=0?"text-emerald-400":"text-red-400", icon:"file"},
+          {label:"Saldo Período", value:minToHHMM(minPeriodo), color:minPeriodo>=0?"text-emerald-400":"text-red-400", icon:"file"},
         ].map((c,i)=>(
           <Card key={i} cls={`p-4 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
             <div className="flex items-center gap-2 mb-2">
@@ -673,12 +761,23 @@ function TelaInicio({ config, registros, setRegistros, dark }: {
             className="p-1.5 rounded-xl hover:bg-slate-700/50 text-slate-400 hover:text-white transition-all">
             <Ic n="chevLeft" size={16}/>
           </button>
-          <h3 className={`font-semibold ${dark?"text-white":"text-slate-800"}`}>{MESES[calMes]} {calAno}</h3>
+          <button
+            onClick={()=>{ const p = periodoMes(calAno, calMes); abrirRelatorioPeriodo(p.inicio, p.fim); }}
+            className={`px-3 py-1 rounded-xl font-semibold transition-all ${dark?"text-white hover:bg-slate-700/50":"text-slate-800 hover:bg-slate-100"}`}>
+            {MESES[calMes]} {calAno}
+          </button>
           <button onClick={()=>{if(calMes===11){setCalMes(0);setCalAno(calAno+1);}else setCalMes(calMes+1);}}
             className="p-1.5 rounded-xl hover:bg-slate-700/50 text-slate-400 hover:text-white transition-all">
             <Ic n="chevRight" size={16}/>
           </button>
         </div>
+        {(calMes!==new Date().getMonth() || calAno!==new Date().getFullYear()) && (
+          <button
+            onClick={()=>{const d=new Date(); setCalMes(d.getMonth()); setCalAno(d.getFullYear());}}
+            className="w-full mb-3 py-2 rounded-xl text-xs font-semibold text-blue-300 bg-blue-500/10 border border-blue-500/20 hover:bg-blue-500/20 transition-all">
+            Voltar ao mês atual
+          </button>
+        )}
         <div className="grid grid-cols-7 gap-1 text-center mb-2">
           {DIAS_SEMANA.map(d=><div key={d} className="text-xs text-slate-500 font-medium">{d}</div>)}
         </div>
@@ -689,12 +788,26 @@ function TelaInicio({ config, registros, setRegistros, dark }: {
             const st=statusDia(d);
             const isHoje=str===hoje;
             const fer=feriados[str];
+            const r=registros[str];
+            const indicadores=[
+              fer ? "bg-blue-400" : "",
+              r?.ausencia==="falta" ? "bg-red-400" : "",
+              r?.ausencia==="atestado" ? "bg-yellow-400" : "",
+              r?.ausencia==="ferias" ? "bg-sky-300" : "",
+              r && calcSaldo(r.batidas, config)!==null ? "bg-emerald-400" : "",
+            ].filter(Boolean);
             return (
               <button key={i} onClick={()=>setDiaSel(str)}
-                className={`relative h-9 flex items-center justify-center rounded-lg text-xs font-medium transition-all hover:ring-2 hover:ring-blue-500/50
+                className={`relative h-11 flex flex-col items-center justify-center rounded-lg text-xs font-medium transition-all hover:ring-2 hover:ring-blue-500/50
                   ${isHoje?"bg-blue-600 text-white ring-2 ring-blue-400":dark?"text-slate-300 hover:bg-slate-700/50":"text-slate-600 hover:bg-slate-100"}
                   ${fer&&!isHoje?"text-blue-400":""}`}>
-                {st?<span className="text-sm leading-none">{st.emoji}</span>:d}
+                <span className="leading-none">{d}</span>
+                {st && <span className="sr-only">{st.emoji}</span>}
+                {indicadores.length>0 && (
+                  <span className="absolute bottom-1 flex gap-0.5">
+                    {indicadores.slice(0,4).map((cor,idx)=><span key={idx} className={`w-1.5 h-1.5 rounded-full ${cor}`}/>)}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -733,7 +846,7 @@ function TelaInicio({ config, registros, setRegistros, dark }: {
                 <>
                   {(() => {
                     const r = registros[diaSel];
-                    const s = r ? calcSaldo(r.batidas, config.escala) : null;
+                    const s = r ? calcSaldo(r.batidas, config) : null;
                     return (
                       <div className="space-y-3">
                         {/* Batidas */}
@@ -902,10 +1015,11 @@ const FORM_VAZIO: Omit<Recebimento,"id"> = {
   outros: "", outrosObs: ""
 };
 
-function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, dark }: {
+function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, periodos = [], dark }: {
   config: Config; registros: Record<string,RegistroDia>;
   financeiro: {recebimentos: Recebimento[]};
   setFinanceiro: React.Dispatch<React.SetStateAction<{recebimentos: Recebimento[]}>>;
+  periodos: Periodo[];
   dark: boolean;
 }) {
   const [aba, setAba] = useState("resumo");
@@ -914,10 +1028,15 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, dark }: 
   const [editId, setEditId] = useState<number|null>(null);
   const [viewRec, setViewRec] = useState<Recebimento|null>(null);
   const [adiantHint, setAdiantHint] = useState(""); // valor esmaecido sugerido
+  const [filtroInicio, setFiltroInicio] = useState("");
+  const [filtroFim, setFiltroFim] = useState("");
 
   const bruto=Number(config.salarioBruto)||0;
   const inss=calcINSS(bruto), irrf=calcIRRF(bruto,inss), liquido=bruto-inss-irrf;
   const rec=financeiro.recebimentos||[];
+  const recFiltrados = rec.filter(r=>entreDatas(r.dataRecebimento || `${r.competencia}-01`, filtroInicio, filtroFim));
+  const heFinanceiroMin = horasExtrasFinanceiras(periodos, registros, config, filtroInicio, filtroFim);
+  const heFinanceiroValor = valorHoraExtra(heFinanceiroMin, config);
 
   // Detectar último adiantamento para sugerir no campo
   function getUltimoAdiantamento(competencia: string): string {
@@ -970,23 +1089,23 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, dark }: 
 
   // Agrupar por competência para exibição
   const porCompetencia: Record<string, Recebimento[]> = {};
-  rec.forEach(r => {
+  recFiltrados.forEach(r => {
     if (!porCompetencia[r.competencia]) porCompetencia[r.competencia] = [];
     porCompetencia[r.competencia].push(r);
   });
 
   // Dados para gráficos - líquido total por competência
-  const competencias = Object.keys(porCompetencia).sort().slice(-12);
+  const competencias = Object.keys(porCompetencia).sort();
   const dadosLinha = competencias.map(c => {
     const [ano, mes] = c.split("-");
     return {
       mes: MESES_CURTOS[parseInt(mes)-1]+"/"+ano.slice(2),
-      liquido: calcTotalMes(rec, c),
+      liquido: calcTotalMes(recFiltrados, c),
     };
   });
 
   const mediaLiquida = competencias.length
-    ? competencias.reduce((a,c)=>a+calcTotalMes(rec,c),0)/competencias.length
+    ? competencias.reduce((a,c)=>a+calcTotalMes(recFiltrados,c),0)/competencias.length
     : liquido;
 
   const dadosPizza=[
@@ -1004,8 +1123,9 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, dark }: 
     let saldo=0;
     for(let dd=1;dd<=total;dd++){
       const str=`${ano}-${String(mes+1).padStart(2,"0")}-${String(dd).padStart(2,"0")}`;
+      if(!entreDatas(str, filtroInicio, filtroFim)) continue;
       const r=registros[str]; if(!r) continue;
-      saldo+=calcSaldo(r.batidas,config.escala)||0;
+      saldo+=calcSaldo(r.batidas, config)||0;
     }
     return {mes:MESES_CURTOS[mes], saldo:parseFloat((saldo/60).toFixed(1))};
   });
@@ -1024,6 +1144,18 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, dark }: 
           </button>
         ))}
       </div>
+
+      <Card cls={`p-3 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
+        <div className="grid grid-cols-2 gap-3">
+          <Inp label="Data inicial" type="date" value={filtroInicio} onChange={setFiltroInicio}/>
+          <Inp label="Data final" type="date" value={filtroFim} onChange={setFiltroFim}/>
+        </div>
+        {(filtroInicio || filtroFim) && (
+          <button onClick={()=>{setFiltroInicio("");setFiltroFim("");}} className="mt-2 text-xs text-blue-400 hover:text-blue-300 font-semibold">
+            Limpar filtro
+          </button>
+        )}
+      </Card>
 
       {aba==="resumo" && (
         <div className="space-y-4">
@@ -1051,6 +1183,20 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, dark }: 
               <p className="text-xs text-slate-400 mt-1">Média mensal baseada em {competencias.length} mês(es)</p>
             </Card>
           )}
+          <Card cls={`p-5 border-blue-500/20 ${dark?"bg-blue-900/20":"bg-blue-50 border-blue-200"}`}>
+            <h3 className={`font-semibold mb-3 ${dark?"text-white":"text-slate-800"}`}>Horas Extras do Período</h3>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <p className="text-xs text-slate-400">Horas consideradas</p>
+                <p className="font-mono font-bold text-blue-300">{minToHHMM(heFinanceiroMin)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-400">Valor estimado</p>
+                <p className="font-mono font-bold text-emerald-400">R$ {heFinanceiroValor.toLocaleString("pt-BR",{minimumFractionDigits:2})}</p>
+              </div>
+            </div>
+            <p className="text-xs text-slate-500 mt-2">Quando houver Hora Extra RH em período fechado, ela tem prioridade sobre o cálculo automático.</p>
+          </Card>
           <div className="grid grid-cols-2 gap-3">
             <Btn onClick={()=>abrirNovoForm("adiantamento")} cls="w-full" sz="md" v="secondary">
               <Ic n="plus" size={15}/>Adiantamento
@@ -1169,7 +1315,7 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, dark }: 
             </div>
           ) : competencias.slice().reverse().map(comp=>{
             const recsComp = porCompetencia[comp];
-            const totalComp = calcTotalMes(rec, comp);
+            const totalComp = calcTotalMes(recFiltrados, comp);
             const temAdiant = recsComp.some(r=>r.tipo==="adiantamento");
             const temPag = recsComp.some(r=>r.tipo==="pagamento");
             return (
@@ -1375,9 +1521,10 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, dark }: 
 // ============================================================
 // TELA: RELATÓRIO / HISTÓRICO
 // ============================================================
-function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos, dark }: {
+function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos, financeiro, dark, filtroInicial }: {
   config: Config; registros: Record<string,RegistroDia>; setRegistros: React.Dispatch<React.SetStateAction<Record<string,RegistroDia>>>;
-  periodos: Periodo[]; setPeriodos: React.Dispatch<React.SetStateAction<Periodo[]>>; dark: boolean;
+  periodos: Periodo[]; setPeriodos: React.Dispatch<React.SetStateAction<Periodo[]>>;
+  financeiro: {recebimentos: Recebimento[]}; dark: boolean; filtroInicial: {inicio:string; fim:string} | null;
 }) {
   const [showFechar, setShowFechar] = useState(false);
   const [fInicio, setFInicio] = useState("");
@@ -1386,6 +1533,17 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
   const [rhPeriodoId, setRhPeriodoId] = useState<string|null>(null);
   const [rhDia, setRhDia] = useState<string|null>(null);
   const [rhVals, setRhVals] = useState<(string|null)[]>([null,null,null,null]);
+  const [rhHoraExtra, setRhHoraExtra] = useState("");
+  const [filtroInicio, setFiltroInicio] = useState(filtroInicial?.inicio || "");
+  const [filtroFim, setFiltroFim] = useState(filtroInicial?.fim || "");
+
+  useEffect(()=>{
+    if(filtroInicial) {
+      setFiltroInicio(filtroInicial.inicio);
+      setFiltroFim(filtroInicial.fim);
+      setExpandido("aberto");
+    }
+  },[filtroInicial]);
 
   const periodoAberto = periodos.find(p=>!p.fechado)||null;
 
@@ -1394,14 +1552,42 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
     const dias: string[] = [];
     let d = periodoAberto.inicio;
     while(d <= (periodoAberto.fim||hojeStr())) {
-      if(registros[d]) dias.push(d);
+      if(registros[d] && entreDatas(d, filtroInicio, filtroFim)) dias.push(d);
       d = addDiasStr(d,1);
       if(d > hojeStr()) break;
     }
     return dias;
   })() : Object.keys(registros).filter(d=>{
-    return !periodos.some(p=>p.fechado&&d>=p.inicio&&d<=p.fim);
+    return !periodos.some(p=>p.fechado&&d>=p.inicio&&d<=p.fim) && entreDatas(d, filtroInicio, filtroFim);
   }).sort();
+
+  const renderResumoPeriodo = (dias: string[], periodo?: Periodo) => {
+    const resumo = resumoRegistros(dias, registros, config);
+    const heMin = periodo?.horaExtraRH ? Math.round(Number(periodo.horaExtraRH)*60) : resumo.extras;
+    const inicioResumo = dias[0] || periodo?.inicio || "";
+    const fimResumo = dias[dias.length-1] || periodo?.fim || "";
+    const bruto = financeiro.recebimentos
+      .filter(r=>inicioResumo && fimResumo && entreDatas(r.dataRecebimento || `${r.competencia}-01`, inicioResumo, fimResumo))
+      .reduce((acc,r)=>acc+calcLiquidoRec(r),0);
+    return (
+      <div className="grid grid-cols-2 gap-2 p-3">
+        {[
+          {l:"Saldo período",v:minToHHMM(resumo.considerado),c:resumo.considerado>=0?"text-emerald-400":"text-red-400"},
+          {l:"Horas extras",v:minToHHMM(heMin),c:"text-emerald-400"},
+          {l:"Valor HE estimado",v:`R$ ${valorHoraExtra(heMin,config).toLocaleString("pt-BR",{minimumFractionDigits:2})}`,c:"text-blue-300"},
+          {l:"Financeiro",v:`R$ ${bruto.toLocaleString("pt-BR",{minimumFractionDigits:2})}`,c:"text-emerald-400"},
+          {l:"Diferença tolerância",v:minToHHMM(resumo.considerado-resumo.bruto),c:"text-yellow-300"},
+          {l:"Dias com ponto",v:String(resumo.diasComPonto),c:dark?"text-white":"text-slate-800"},
+        ].map((item,i)=>(
+          <div key={i} className={`p-3 rounded-xl ${dark?"bg-slate-700/30":"bg-slate-100"}`}>
+            <p className="text-xs text-slate-400">{item.l}</p>
+            <p className={`font-mono font-bold text-sm ${item.c}`}>{item.v}</p>
+          </div>
+        ))}
+        {periodo?.horaExtraRH && <div className="col-span-2"><Badge color="yellow">Hora Extra RH aplicada</Badge></div>}
+      </div>
+    );
+  };
 
   function fecharPeriodo() {
     if(!fInicio||!fFim) return;
@@ -1423,7 +1609,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
     while(d<=fFim){
       const r=registros[d];
       if(r){
-        const s=calcSaldo(r.batidas,config.escala);
+        const s=calcSaldo(r.batidas, config);
         if(s!==null) totalMin+=s;
         if(r.ausencia==="falta") faltas++;
         if(r.ausencia==="atestado") atestados++;
@@ -1446,7 +1632,16 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
     if(!rhDia) return;
     const r=registros[rhDia]||{batidas:[null,null,null,null],editado:[false,false,false,false],ausencia:"",observacao:""};
     setRegistros(prev=>({...prev,[rhDia]:{...r,rhDivergencias:rhVals}}));
+    if(rhPeriodoId) {
+      setPeriodos(prev=>prev.map(p=>p.id===rhPeriodoId?{...p,horaExtraRH:rhHoraExtra}:p));
+    }
     setRhDia(null); setRhVals([null,null,null,null]);
+  }
+
+  function reabrirPeriodo(id: string) {
+    if(!window.confirm("Reabrir este período para correções? Os cálculos serão atualizados automaticamente.")) return;
+    setPeriodos(prev=>prev.map(p=>p.id===id?{...p,fechado:false}:p));
+    setExpandido("aberto");
   }
 
   return (
@@ -1455,6 +1650,18 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
         <h2 className={`text-xl font-bold ${dark?"text-white":"text-slate-800"}`}>Relatório</h2>
         <Btn onClick={()=>setShowFechar(true)} v="warning" sz="sm"><Ic n="lock" size={14}/>Fechar Período</Btn>
       </div>
+
+      <Card cls={`p-3 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
+        <div className="grid grid-cols-2 gap-3">
+          <Inp label="Data inicial" type="date" value={filtroInicio} onChange={setFiltroInicio}/>
+          <Inp label="Data final" type="date" value={filtroFim} onChange={setFiltroFim}/>
+        </div>
+        {(filtroInicio || filtroFim) && (
+          <button onClick={()=>{setFiltroInicio("");setFiltroFim("");}} className="mt-2 text-xs text-blue-400 hover:text-blue-300 font-semibold">
+            Limpar filtro
+          </button>
+        )}
+      </Card>
 
       {/* Período Aberto */}
       <Card cls={`border-slate-700/50 overflow-hidden ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
@@ -1469,11 +1676,12 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
         </button>
         {expandido==="aberto" && (
           <div className="divide-y divide-slate-700/30">
+            {diasAbertos.length>0 && renderResumoPeriodo(diasAbertos)}
             {diasAbertos.length===0 ? (
               <p className="text-slate-400 text-sm text-center py-6">Nenhuma marcação no período aberto.</p>
             ) : diasAbertos.map(dia=>{
               const r=registros[dia];
-              const s=calcSaldo(r.batidas,config.escala);
+              const s=calcSaldo(r.batidas, config);
               return (
                 <div key={dia} className="p-3">
                   <div className="flex justify-between items-start">
@@ -1499,14 +1707,14 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
       </Card>
 
       {/* Períodos Fechados */}
-      {periodos.filter(p=>p.fechado).slice().reverse().map(periodo=>{
+      {periodos.filter(p=>p.fechado && (!filtroInicio || p.fim >= filtroInicio) && (!filtroFim || p.inicio <= filtroFim)).slice().reverse().map(periodo=>{
         const diasPeriodo: string[] = [];
         let d=periodo.inicio;
         while(d<=periodo.fim){
-          if(registros[d]) diasPeriodo.push(d);
+          if(registros[d] && entreDatas(d, filtroInicio, filtroFim)) diasPeriodo.push(d);
           d=addDiasStr(d,1);
         }
-        const saldoTotal=diasPeriodo.reduce((acc,dia)=>acc+(calcSaldo(registros[dia].batidas,config.escala)||0),0);
+        const saldoTotal=diasPeriodo.reduce((acc,dia)=>acc+(calcSaldo(registros[dia].batidas, config)||0),0);
         const isExp=expandido===periodo.id;
 
         return (
@@ -1525,9 +1733,14 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
 
             {isExp && (
               <div className="p-4 space-y-3">
+                {renderResumoPeriodo(diasPeriodo, periodo)}
+                <div className="flex gap-2">
+                  <Inp label="Hora Extra RH" type="number" value={periodo.horaExtraRH||""} onChange={v=>setPeriodos(prev=>prev.map(p=>p.id===periodo.id?{...p,horaExtraRH:v}:p))} hint="Horas oficiais consideradas pelo RH"/>
+                  <Btn onClick={()=>reabrirPeriodo(periodo.id)} v="secondary" sz="sm" cls="self-end mb-5">Reabrir</Btn>
+                </div>
                 {diasPeriodo.map(dia=>{
                   const r=registros[dia];
-                  const s=calcSaldo(r.batidas,config.escala);
+                  const s=calcSaldo(r.batidas, config);
                   const temRH=r.rhDivergencias?.some(v=>v);
                   return (
                     <div key={dia} className={`p-3 rounded-xl ${dark?"bg-slate-700/30":"bg-slate-100"}`}>
@@ -1535,7 +1748,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
                         <p className={`text-sm font-medium ${dark?"text-white":"text-slate-700"}`}>{formatarData(dia)}</p>
                         <div className="flex items-center gap-2">
                           {s!==null && <span className={`font-mono text-xs font-bold ${s>=0?"text-emerald-400":"text-red-400"}`}>{minToHHMM(s)}</span>}
-                          <button onClick={()=>{setRhDia(dia);setRhPeriodoId(periodo.id);setRhVals(r.rhDivergencias||[null,null,null,null]);}}
+                          <button onClick={()=>{setRhDia(dia);setRhPeriodoId(periodo.id);setRhHoraExtra(periodo.horaExtraRH||"");setRhVals(r.rhDivergencias||[null,null,null,null]);}}
                             className={`text-xs px-2 py-1 rounded-lg border transition-all ${temRH?"border-yellow-500/30 text-yellow-400":"border-slate-600 text-slate-400 hover:text-white"}`}>
                             {temRH?"⚠️ RH":"+ RH"}
                           </button>
@@ -1589,6 +1802,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
               <button onClick={()=>setRhDia(null)} className="text-slate-400 hover:text-white"><Ic n="x" size={18}/></button>
             </div>
             <p className="text-xs text-slate-400">Insira apenas as marcações que divergem da folha do RH. Deixe em branco o que estiver correto.</p>
+            <Inp label="Hora Extra RH" type="number" value={rhHoraExtra} onChange={setRhHoraExtra} hint="Quantidade oficial de horas extras do período fechado"/>
             <div className="space-y-3">
               {NOMES_BATIDAS.map((nome,i)=>{
                 const meu=registros[rhDia]?.batidas[i];
@@ -2004,6 +2218,7 @@ export default function MeuPonto() {
   const [dark, setDark] = useState(true);
   const [aba, setAba] = useState("ponto"); // tela principal
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [filtroRelatorio, setFiltroRelatorio] = useState<{inicio:string; fim:string} | null>(null);
 
   useEffect(()=>{
     try{ const c=localStorage.getItem("mp_config_v2"); if(c) setDark(JSON.parse(c).darkMode!==false); } catch{}
@@ -2029,6 +2244,12 @@ export default function MeuPonto() {
 
   function navegarPara(key: string) {
     setAba(key);
+    setDrawerOpen(false);
+  }
+
+  function abrirRelatorioPeriodo(inicio: string, fim: string) {
+    setFiltroRelatorio({inicio, fim});
+    setAba("relatorio");
     setDrawerOpen(false);
   }
 
@@ -2070,10 +2291,10 @@ export default function MeuPonto() {
 
       {/* Conteúdo principal */}
       <main className="max-w-lg mx-auto px-4 pt-5 pb-24 relative">
-        {aba==="inicio" && <TelaInicio config={config} registros={registros} setRegistros={setRegistros} dark={dark}/>}
+        {aba==="inicio" && <TelaInicio config={config} registros={registros} setRegistros={setRegistros} dark={dark} abrirRelatorioPeriodo={abrirRelatorioPeriodo}/>}
         {aba==="ponto" && <TelaPonto config={config} registros={registros} setRegistros={setRegistros} periodos={periodos} dark={dark}/>}
-        {aba==="financeiro" && <TelaFinanceiro config={config} registros={registros} financeiro={financeiro} setFinanceiro={setFinanceiro} dark={dark}/>}
-        {aba==="relatorio" && <TelaRelatorio config={config} registros={registros} setRegistros={setRegistros} periodos={periodos} setPeriodos={setPeriodos} dark={dark}/>}
+        {aba==="financeiro" && <TelaFinanceiro config={config} registros={registros} financeiro={financeiro} setFinanceiro={setFinanceiro} periodos={periodos} dark={dark}/>}
+        {aba==="relatorio" && <TelaRelatorio config={config} registros={registros} setRegistros={setRegistros} periodos={periodos} setPeriodos={setPeriodos} financeiro={financeiro} dark={dark} filtroInicial={filtroRelatorio}/>}
         {aba==="ferias" && <TelaFerias config={config} ferias={ferias} setFerias={setFerias} dark={dark}/>}
         {aba==="config" && <TelaConfig config={config} setConfig={setConfig} dark={dark} setDark={setDark}/>}
         {aba==="backup" && <TelaBackup config={config} setConfig={setConfig} registros={registros} setRegistros={setRegistros} financeiro={financeiro} setFinanceiro={setFinanceiro} ferias={ferias} setFerias={setFerias} periodos={periodos} setPeriodos={setPeriodos} dark={dark}/>}
