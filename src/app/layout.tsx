@@ -1,10 +1,13 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
   title: "MeuPonto",
   description: "Controle de ponto para trabalhadores CLT",
   manifest: "/manifest.json",
+};
+
+export const viewport: Viewport = {
   themeColor: "#1E40AF",
 };
 

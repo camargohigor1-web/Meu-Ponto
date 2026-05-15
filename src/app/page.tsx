@@ -36,6 +36,7 @@ interface Recebimento {
   outrosObs: string;
 }
 interface Notificacao { id: number; label: string; horario: string; antecedencia: number; ativa: boolean; mensagem: string; }
+interface FeriasRegistro { id: number; inicio: string; fim: string; obs: string; valorRecebido?: string; }
 interface Config {
   nome: string; empresa: string; cargo: string; admissao: string; salarioBruto: string;
   escala: { dias: number[]; entrada: string; saidaAlmoco: string; voltaAlmoco: string; saida: string; };
@@ -169,29 +170,30 @@ function formatarData(s: string): string {
   const [y,m,d] = s.split("-");
   return `${d}/${m}/${y}`;
 }
-function minutosPrevistos(escala: Config["escala"]): number {
-  return (parseHHMM(escala.saida)-parseHHMM(escala.voltaAlmoco))+(parseHHMM(escala.saidaAlmoco)-parseHHMM(escala.entrada));
+function minutosPrevistos(config: Config): number {
+  return Math.max(0, parseHHMM(config.escala.saida)-parseHHMM(config.escala.entrada)-Math.max(0, Number(config.almocoDuracao)||0));
 }
-function calcSaldoBruto(batidas: (string|null)[], escala: Config["escala"]): number | null {
+function calcSaldoBruto(batidas: (string|null)[], config: Config): number | null {
   const [e,sa,va,s] = batidas;
   if (!e||!sa||!va||!s) return null;
   const trab = (parseHHMM(s)-parseHHMM(va))+(parseHHMM(sa)-parseHHMM(e));
-  return trab - minutosPrevistos(escala);
+  return trab - minutosPrevistos(config);
 }
 function calcSaldo(batidas: (string|null)[], config: Config): number | null {
   const [e,sa,va,s] = batidas;
   if (!e||!sa||!va||!s) return null;
-  const padroes = [config.escala.entrada, config.escala.saidaAlmoco, config.escala.voltaAlmoco, config.escala.saida];
+  const padroes = [config.escala.entrada, "", "", config.escala.saida];
   const tolerancia = Math.max(0, Number(config.tolerancia)||0);
   if (config.toleranciaTipo === "marcacao") {
     const ajustadas = batidas.map((b,i) => {
       if (!b) return b;
+      if (i === 1 || i === 2) return b;
       const diff = parseHHMM(b) - parseHHMM(padroes[i]);
       return Math.abs(diff) <= tolerancia ? padroes[i] : b;
     });
-    return calcSaldoBruto(ajustadas, config.escala);
+    return calcSaldoBruto(ajustadas, config);
   }
-  const bruto = calcSaldoBruto(batidas, config.escala);
+  const bruto = calcSaldoBruto(batidas, config);
   if (bruto === null) return null;
   return Math.abs(bruto) <= tolerancia ? 0 : bruto;
 }
@@ -236,7 +238,7 @@ function resumoRegistros(dias: string[], registros: Record<string,RegistroDia>, 
   return dias.reduce((acc, dia) => {
     const r = registros[dia];
     if (!r) return acc;
-    const bruto = calcSaldoBruto(r.batidas, config.escala);
+    const bruto = calcSaldoBruto(r.batidas, config);
     const considerado = calcSaldo(r.batidas, config);
     if (bruto !== null) acc.bruto += bruto;
     if (considerado !== null) {
@@ -402,6 +404,14 @@ function Badge({ children, color="blue" }: { children: React.ReactNode; color?: 
   return <span className={`px-2 py-0.5 rounded-full text-xs border font-medium ${c[color]}`}>{children}</span>;
 }
 
+function urlBase64ToArrayBuffer(base64: string): ArrayBuffer {
+  const padding = "=".repeat((4 - base64.length % 4) % 4);
+  const normalized = (base64 + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = window.atob(normalized);
+  const bytes = Uint8Array.from(Array.from(raw).map(char => char.charCodeAt(0)));
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+
 // ============================================================
 // TELA: PONTO
 // ============================================================
@@ -426,7 +436,8 @@ function TelaPonto({ config, registros, setRegistros, periodos, dark }: {
   const hoje = hojeStr();
   const ehHoje = diaAtual === hoje;
   const reg = registros[diaAtual] || { batidas:[null,null,null,null], editado:[false,false,false,false], ausencia:"", observacao:"" };
-  const padroes = [config.escala.entrada, config.escala.saidaAlmoco, config.escala.voltaAlmoco, config.escala.saida];
+  const voltaAlmocoPrevista = reg.batidas[1] ? minToHHMM(parseHHMM(reg.batidas[1]) + config.almocoDuracao).replace("+","") : "";
+  const padroes = [config.escala.entrada, config.escala.saidaAlmoco, voltaAlmocoPrevista, config.escala.saida];
   const proxIdx = reg.batidas.findIndex(b=>!b);
   const saldo = calcSaldo(reg.batidas, config);
   const podeBater = ehHoje && (modoEdicao || ehHoje);
@@ -470,6 +481,13 @@ function TelaPonto({ config, registros, setRegistros, periodos, dark }: {
   const countdown = (() => {
     if (!hora || reg.batidas[3] || !reg.batidas[2]) return null;
     return parseHHMM(config.escala.saida) - (hora.getHours()*60+hora.getMinutes());
+  })();
+
+  const almocoCountdown = (() => {
+    if (!hora || !reg.batidas[1] || reg.batidas[2]) return null;
+    const fim = parseHHMM(reg.batidas[1]) + Math.max(0, Number(config.almocoDuracao)||0);
+    const agora = hora.getHours()*60 + hora.getMinutes() + hora.getSeconds()/60;
+    return Math.ceil((fim - agora) * 60);
   })();
 
   const diaLabel = (() => {
@@ -557,6 +575,19 @@ function TelaPonto({ config, registros, setRegistros, periodos, dark }: {
         </Card>
       )}
 
+      {almocoCountdown !== null && (
+        <Card cls={`p-3 border-emerald-500/20 ${dark?"bg-emerald-900/20":"bg-emerald-50"}`}>
+          <div className="flex justify-between items-center">
+            <span className="text-sm text-emerald-300">Intervalo de almoço</span>
+            <span className={`font-mono font-bold ${almocoCountdown>0?"text-emerald-400":"text-blue-400"}`}>
+              {almocoCountdown>0
+                ? `${String(Math.floor(almocoCountdown/60)).padStart(2,"0")}:${String(almocoCountdown%60).padStart(2,"0")}`
+                : "Intervalo concluído"}
+            </span>
+          </div>
+        </Card>
+      )}
+
       {/* Registros do dia */}
       <Card cls={`border-slate-700/50 overflow-hidden ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
         <div className={`px-4 py-3 border-b flex justify-between items-center ${dark?"border-slate-700/50":"border-slate-200"}`}>
@@ -568,7 +599,7 @@ function TelaPonto({ config, registros, setRegistros, periodos, dark }: {
         {NOMES_BATIDAS.map((nome,i) => {
           const batida = reg.batidas[i];
           const padrao = padroes[i];
-          const diff = batida ? parseHHMM(batida)-parseHHMM(padrao) : null;
+          const diff = batida && i !== 1 && i !== 2 ? parseHHMM(batida)-parseHHMM(padrao) : null;
           return (
             <div key={i} className={`flex items-center px-4 py-3 ${dark?"border-b border-slate-700/30 last:border-0":"border-b border-slate-100 last:border-0"}`}>
               <div className="flex-1">
@@ -1836,11 +1867,12 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
 // TELA: FÉRIAS
 // ============================================================
 function TelaFerias({ config, ferias, setFerias, dark }: {
-  config: Config; ferias: {historico:{id:number;inicio:string;fim:string;obs:string}[]};
-  setFerias: React.Dispatch<React.SetStateAction<{historico:{id:number;inicio:string;fim:string;obs:string}[]}>>; dark: boolean;
+  config: Config; ferias: {historico:FeriasRegistro[]};
+  setFerias: React.Dispatch<React.SetStateAction<{historico:FeriasRegistro[]}>>; dark: boolean;
 }) {
-  const [form, setForm] = useState({inicio:"",fim:"",obs:""});
+  const [form, setForm] = useState({inicio:"",fim:"",obs:"",valorRecebido:""});
   const [show, setShow] = useState(false);
+  const [editandoId, setEditandoId] = useState<number|null>(null);
   const admissao=config.admissao?new Date(config.admissao):null;
   const hoje=new Date();
   let diasAdq=0, prog=0, iniP: Date|null=null, fimP: Date|null=null;
@@ -1857,6 +1889,36 @@ function TelaFerias({ config, ferias, setFerias, dark }: {
   const bruto=Number(config.salarioBruto)||0;
   const inss=calcINSS(bruto), irrf=calcIRRF(bruto,inss), liq=bruto-inss-irrf;
   const valorFerias=liq+(liq/3);
+  const valorRecebido=(ferias.historico||[]).reduce((acc,f)=>acc+(Number(f.valorRecebido)||0),0);
+  const valorRestante=Math.max(0,valorFerias-valorRecebido);
+
+  function abrirNovo() {
+    setForm({inicio:"",fim:"",obs:"",valorRecebido:""});
+    setEditandoId(null);
+    setShow(true);
+  }
+
+  function abrirEdicao(f: FeriasRegistro) {
+    setForm({inicio:f.inicio,fim:f.fim,obs:f.obs||"",valorRecebido:f.valorRecebido||""});
+    setEditandoId(f.id);
+    setShow(true);
+  }
+
+  function salvarFerias() {
+    if (!form.inicio || !form.fim) return;
+    setFerias(p=>{
+      const registro = {...form,id:editandoId ?? Date.now()};
+      return {
+        ...p,
+        historico: editandoId
+          ? p.historico.map(f=>f.id===editandoId?registro:f)
+          : [...p.historico,registro],
+      };
+    });
+    setShow(false);
+    setEditandoId(null);
+    setForm({inicio:"",fim:"",obs:"",valorRecebido:""});
+  }
 
   return (
     <div className="space-y-4 pb-6">
@@ -1887,21 +1949,32 @@ function TelaFerias({ config, ferias, setFerias, dark }: {
         <div className="space-y-2 text-sm">
           <div className="flex justify-between"><span className="text-slate-400">Salário líquido</span><span className="font-mono text-white">R$ {liq.toLocaleString("pt-BR",{minimumFractionDigits:2})}</span></div>
           <div className="flex justify-between"><span className="text-slate-400">+ 1/3 constitucional</span><span className="font-mono text-emerald-400">R$ {(liq/3).toLocaleString("pt-BR",{minimumFractionDigits:2})}</span></div>
+          <div className="flex justify-between"><span className="text-slate-400">Recebido registrado</span><span className="font-mono text-blue-300">R$ {valorRecebido.toLocaleString("pt-BR",{minimumFractionDigits:2})}</span></div>
           <div className="flex justify-between pt-2 border-t border-emerald-500/20">
             <span className="font-semibold text-emerald-300">Total estimado</span>
             <span className="font-mono font-bold text-emerald-400 text-lg">R$ {valorFerias.toLocaleString("pt-BR",{minimumFractionDigits:2})}</span>
           </div>
+          <div className="flex justify-between">
+            <span className="font-semibold text-slate-300">Restante</span>
+            <span className="font-mono font-bold text-yellow-300">R$ {valorRestante.toLocaleString("pt-BR",{minimumFractionDigits:2})}</span>
+          </div>
         </div>
       </Card>
-      <Btn onClick={()=>setShow(true)} cls="w-full" sz="lg"><Ic n="plus" size={16}/>Registrar Férias</Btn>
+      <Btn onClick={abrirNovo} cls="w-full" sz="lg"><Ic n="plus" size={16}/>Registrar Férias</Btn>
       {(ferias.historico||[]).map(f=>{
         const dias=Math.round((new Date(f.fim).getTime()-new Date(f.inicio).getTime())/(1000*60*60*24))+1;
         return (
           <Card key={f.id} cls={`p-4 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
-            <div className="flex justify-between items-start">
+            <div className="flex justify-between items-start gap-3">
               <div><p className={`font-medium ${dark?"text-white":"text-slate-700"}`}>{formatarData(f.inicio)} → {formatarData(f.fim)}</p>
+              {f.valorRecebido&&<p className="text-xs text-emerald-400 mt-0.5">Recebido: R$ {Number(f.valorRecebido).toLocaleString("pt-BR",{minimumFractionDigits:2})}</p>}
               {f.obs&&<p className="text-xs text-slate-400 mt-0.5">{f.obs}</p>}</div>
-              <Badge color="blue">{dias} dias</Badge>
+              <div className="flex items-center gap-2">
+                <Badge color="blue">{dias} dias</Badge>
+                <button onClick={()=>abrirEdicao(f)} className="text-slate-500 hover:text-blue-400 transition-colors p-1">
+                  <Ic n="edit" size={14}/>
+                </button>
+              </div>
             </div>
           </Card>
         );
@@ -1909,13 +1982,14 @@ function TelaFerias({ config, ferias, setFerias, dark }: {
       {show&&(
         <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4">
           <div className={`w-full max-w-sm rounded-2xl p-6 space-y-4 ${dark?"bg-slate-800 border border-slate-700":"bg-white"}`}>
-            <h3 className={`font-bold ${dark?"text-white":"text-slate-800"}`}>Registrar Férias</h3>
+            <h3 className={`font-bold ${dark?"text-white":"text-slate-800"}`}>{editandoId?"Editar Férias":"Registrar Férias"}</h3>
             <Inp label="Início" type="date" value={form.inicio} onChange={v=>setForm(p=>({...p,inicio:v}))}/>
             <Inp label="Fim" type="date" value={form.fim} onChange={v=>setForm(p=>({...p,fim:v}))}/>
+            <Inp label="Valor recebido (R$)" type="number" value={form.valorRecebido} onChange={v=>setForm(p=>({...p,valorRecebido:v}))}/>
             <Inp label="Observação" value={form.obs} onChange={v=>setForm(p=>({...p,obs:v}))}/>
             <div className="flex gap-3">
-              <Btn onClick={()=>{setFerias(p=>({...p,historico:[...p.historico,{...form,id:Date.now()}]}));setShow(false);}} cls="flex-1" v="success">Salvar</Btn>
-              <Btn v="secondary" onClick={()=>setShow(false)} cls="flex-1">Cancelar</Btn>
+              <Btn onClick={salvarFerias} cls="flex-1" v="success">Salvar</Btn>
+              <Btn v="secondary" onClick={()=>{setShow(false);setEditandoId(null);}} cls="flex-1">Cancelar</Btn>
             </div>
           </div>
         </div>
@@ -1935,11 +2009,69 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
   const [rascunho, setRascunho] = useState<Config>(config);
   const [novaNotif, setNovaNotif] = useState({label:"",horario:"",antecedencia:5,mensagem:""});
   const [showNovaNotif, setShowNovaNotif] = useState(false);
+  const [pushStatus, setPushStatus] = useState("Verificando...");
+  const [pushSubscription, setPushSubscription] = useState<PushSubscription|null>(null);
 
   function iniciarEdicao() { setRascunho(config); setEditando(true); }
   function salvar() { setConfig(rascunho); setEditando(false); }
   function cancelar() { setRascunho(config); setEditando(false); }
   const upd = (k: keyof Config, v: unknown) => setRascunho(p=>({...p,[k]:v}));
+
+  useEffect(()=>{
+    if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+      setPushStatus("Indisponível neste navegador");
+      return;
+    }
+    setPushStatus(Notification.permission === "granted" ? "Permitido" : Notification.permission === "denied" ? "Bloqueado" : "Não ativado");
+    navigator.serviceWorker.getRegistration("/push/").then(async reg=>{
+      const sub = await reg?.pushManager.getSubscription();
+      if (sub) setPushSubscription(sub);
+    }).catch(()=>{});
+  },[]);
+
+  async function ativarPush() {
+    if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+      setPushStatus("Indisponível neste navegador");
+      return;
+    }
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") {
+      setPushStatus(permission === "denied" ? "Bloqueado" : "Não ativado");
+      return;
+    }
+    const keyResponse = await fetch("/api/push/public-key");
+    const { publicKey } = await keyResponse.json();
+    if (!publicKey) {
+      setPushStatus("VAPID não configurado");
+      return;
+    }
+    const reg = await navigator.serviceWorker.register("/push-sw.js", { scope: "/push/" });
+    const current = await reg.pushManager.getSubscription();
+    const sub = current || await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToArrayBuffer(publicKey),
+    });
+    await fetch("/api/push/subscribe", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(sub),
+    });
+    setPushSubscription(sub);
+    setPushStatus("Permitido");
+  }
+
+  async function testarPush() {
+    if (!pushSubscription) {
+      await ativarPush();
+      return;
+    }
+    const res = await fetch("/api/push/test", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ subscription: pushSubscription, body: "Teste de notificação do MeuPonto." }),
+    });
+    setPushStatus(res.ok ? "Teste enviado" : "Falha no teste");
+  }
 
   // Componente de campo somente leitura
   function Campo({ label, value }: { label: string; value: string|number }) {
@@ -2037,8 +2169,8 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <Inp label="Entrada" type="time" value={rascunho.escala.entrada} onChange={v=>upd("escala",{...rascunho.escala,entrada:v})}/>
-                <Inp label="Saída Almoço" type="time" value={rascunho.escala.saidaAlmoco} onChange={v=>upd("escala",{...rascunho.escala,saidaAlmoco:v})}/>
-                <Inp label="Volta Almoço" type="time" value={rascunho.escala.voltaAlmoco} onChange={v=>upd("escala",{...rascunho.escala,voltaAlmoco:v})}/>
+                <Inp label="Horário de almoço" type="time" value={rascunho.escala.saidaAlmoco} onChange={v=>upd("escala",{...rascunho.escala,saidaAlmoco:v})}/>
+                <Inp label="Tempo do intervalo (min)" type="number" value={rascunho.almocoDuracao} onChange={v=>upd("almocoDuracao",Number(v))}/>
                 <Inp label="Saída" type="time" value={rascunho.escala.saida} onChange={v=>upd("escala",{...rascunho.escala,saida:v})}/>
               </div>
               <Inp label="Dia de fechamento" type="number" value={rascunho.fechamentoDia} onChange={v=>upd("fechamentoDia",Number(v))} hint="Ex: 25"/>
@@ -2058,8 +2190,8 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <Campo label="Entrada" value={config.escala.entrada}/>
-                <Campo label="Saída Almoço" value={config.escala.saidaAlmoco}/>
-                <Campo label="Volta Almoço" value={config.escala.voltaAlmoco}/>
+                <Campo label="Horário de almoço" value={config.escala.saidaAlmoco}/>
+                <Campo label="Tempo do intervalo" value={`${config.almocoDuracao} min`}/>
                 <Campo label="Saída" value={config.escala.saida}/>
                 <Campo label="Fechamento" value={`Dia ${config.fechamentoDia}`}/>
               </div>
@@ -2070,6 +2202,19 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
 
       {aba==="notif" && (
         <div className="space-y-3">
+          <Card cls={`p-4 border-blue-500/20 ${dark?"bg-blue-900/20":"bg-blue-50 border-blue-200"}`}>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className={`text-sm font-semibold ${dark?"text-white":"text-slate-800"}`}>Web Push</p>
+                <p className="text-xs text-slate-400 mt-0.5">Status: {pushStatus}</p>
+                <p className="text-xs text-slate-500 mt-1">Requer VAPID configurado no ambiente e armazenamento permanente para produção.</p>
+              </div>
+              <div className="flex flex-col gap-2">
+                <Btn onClick={ativarPush} sz="sm" v="secondary"><Ic n="bell" size={13}/>Ativar</Btn>
+                <Btn onClick={testarPush} sz="sm"><Ic n="check" size={13}/>Testar</Btn>
+              </div>
+            </div>
+          </Card>
           {config.notificacoes.map(n=>(
             <Card key={n.id} cls={`p-4 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
               <div className="flex items-start justify-between gap-2">
@@ -2130,7 +2275,7 @@ function TelaBackup({ config, setConfig, registros, setRegistros, financeiro, se
   config: Config; setConfig: React.Dispatch<React.SetStateAction<Config>>;
   registros: Record<string,RegistroDia>; setRegistros: React.Dispatch<React.SetStateAction<Record<string,RegistroDia>>>;
   financeiro: {recebimentos:Recebimento[]}; setFinanceiro: React.Dispatch<React.SetStateAction<{recebimentos:Recebimento[]}>>;
-  ferias: {historico:{id:number;inicio:string;fim:string;obs:string}[]}; setFerias: React.Dispatch<React.SetStateAction<{historico:{id:number;inicio:string;fim:string;obs:string}[]}>>;
+  ferias: {historico:FeriasRegistro[]}; setFerias: React.Dispatch<React.SetStateAction<{historico:FeriasRegistro[]}>>;
   periodos: Periodo[]; setPeriodos: React.Dispatch<React.SetStateAction<Periodo[]>>;
   dark: boolean;
 }) {
@@ -2213,7 +2358,7 @@ export default function MeuPonto() {
   const [config, setConfig] = useLocalStorage<Config>("mp_config_v2", DEFAULT_CONFIG);
   const [registros, setRegistros] = useLocalStorage<Record<string,RegistroDia>>("mp_registros_v2", {});
   const [financeiro, setFinanceiro] = useLocalStorage<{recebimentos:Recebimento[]}>("mp_financeiro_v2", {recebimentos:[]});
-  const [ferias, setFerias] = useLocalStorage<{historico:{id:number;inicio:string;fim:string;obs:string}[]}>("mp_ferias_v2", {historico:[]});
+  const [ferias, setFerias] = useLocalStorage<{historico:FeriasRegistro[]}>("mp_ferias_v2", {historico:[]});
   const [periodos, setPeriodos] = useLocalStorage<Periodo[]>("mp_periodos_v2", []);
   const [dark, setDark] = useState(true);
   const [aba, setAba] = useState("ponto"); // tela principal
