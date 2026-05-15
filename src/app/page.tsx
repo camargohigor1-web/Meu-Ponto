@@ -31,12 +31,17 @@ interface Recebimento {
   inss: string;
   irrf: string;
   vt: string;
+  va: string;
   vr: string;
+  planoSaude: string;
+  planoOdonto: string;
   outros: string;
   outrosObs: string;
 }
 interface Notificacao { id: number; label: string; horario: string; antecedencia: number; ativa: boolean; mensagem: string; }
 interface FeriasRegistro { id: number; inicio: string; fim: string; obs: string; valorRecebido?: string; }
+interface SalarioHistorico { id: number; dataInicio: string; valor: string; obs: string; }
+interface DecimoTerceiroPagamento { id: number; data: string; parcela: "1a" | "2a"; valor: string; obs: string; }
 interface Config {
   nome: string; empresa: string; cargo: string; admissao: string; salarioBruto: string;
   escala: { dias: number[]; entrada: string; saidaAlmoco: string; voltaAlmoco: string; saida: string; };
@@ -44,6 +49,16 @@ interface Config {
   almocoDuracao: number; fechamentoDia: number; pagamentoDia: number; adiantamentoDia: number;
   adicionalHE: number; darkMode: boolean;
   notificacoes: Notificacao[];
+  // Descontos fixos mensais
+  descontoVT: string;
+  descontoVA: string;
+  descontoVR: string;
+  descontoPlanoSaude: string;
+  descontoPlanoOdonto: string;
+  descontoOutros: string;
+  descontoOutrosObs: string;
+  // Histórico de salários
+  salarioHistorico: SalarioHistorico[];
 }
 
 // ============================================================
@@ -123,6 +138,10 @@ const DEFAULT_CONFIG: Config = {
   escala: { dias: [1,2,3,4,5], entrada: "08:00", saidaAlmoco: "12:00", voltaAlmoco: "13:00", saida: "17:00" },
   tolerancia: 5, toleranciaTipo: "marcacao", almocoDuracao: 60,
   fechamentoDia: 25, pagamentoDia: 5, adiantamentoDia: 20, adicionalHE: 50, darkMode: true,
+  descontoVT: "", descontoVA: "", descontoVR: "",
+  descontoPlanoSaude: "", descontoPlanoOdonto: "",
+  descontoOutros: "", descontoOutrosObs: "",
+  salarioHistorico: [],
   notificacoes: [
     { id: 1, label: "Entrada", horario: "07:55", antecedencia: 5, ativa: true, mensagem: "☀️ Hora de registrar sua entrada!" },
     { id: 2, label: "Almoço", horario: "11:55", antecedencia: 5, ativa: true, mensagem: "🍽️ Faltam 5 minutos para o almoço!" },
@@ -152,6 +171,28 @@ function calcIRRF(b: number, inss: number): number {
   }
   return 0;
 }
+// Retorna o salário bruto vigente para uma data (considera histórico)
+function salarioBrutoNaData(config: Config, data: string): number {
+  const hist = (config.salarioHistorico || []).slice().sort((a,b)=>a.dataInicio.localeCompare(b.dataInicio));
+  let valor = Number(config.salarioBruto) || 0;
+  // O campo salarioBruto sempre é o atual; histórico guarda os anteriores
+  for (const h of hist) {
+    if (h.dataInicio <= data) valor = Number(h.valor) || 0;
+  }
+  // se há entrada no histórico posterior, o salarioBruto atual se aplica
+  // Na prática: histórico ordenado, o último <= data prevalece
+  return valor;
+}
+
+// Verifica se um dia é útil conforme a escala configurada
+function isDiaUtil(data: string, config: Config, feriados: Record<string,string>): boolean {
+  const d = strParaData(data);
+  const diaSemana = d.getDay();
+  if (!config.escala.dias.includes(diaSemana)) return false;
+  if (feriados[data]) return false;
+  return true;
+}
+
 function parseHHMM(s: string): number {
   if (!s) return 0;
   const [h, m] = s.split(":").map(Number);
@@ -234,10 +275,17 @@ function listarDias(inicio: string, fim: string, somenteComRegistro = false, reg
   }
   return dias;
 }
-function resumoRegistros(dias: string[], registros: Record<string,RegistroDia>, config: Config) {
+function resumoRegistros(dias: string[], registros: Record<string,RegistroDia>, config: Config, feriados: Record<string,string> = {}) {
   return dias.reduce((acc, dia) => {
     const r = registros[dia];
-    if (!r) return acc;
+    // Ignora dias fora da escala (fins de semana / feriados) sem ausência marcada
+    const util = isDiaUtil(dia, config, feriados);
+    if (!r) {
+      // dia útil sem registro = não contabiliza (usuário não registrou)
+      return acc;
+    }
+    // Se tem ausência e é feriado/folga/férias — não conta negativamente
+    if (!util && !r.ausencia) return acc;
     const bruto = calcSaldoBruto(r.batidas, config);
     const considerado = calcSaldo(r.batidas, config);
     if (bruto !== null) acc.bruto += bruto;
@@ -252,11 +300,28 @@ function resumoRegistros(dias: string[], registros: Record<string,RegistroDia>, 
     return acc;
   }, {bruto:0, considerado:0, extras:0, negativas:0, faltas:0, atestados:0, diasComPonto:0});
 }
+// Conta dias úteis em um período (excluindo fins de semana e feriados)
+function contarDiasUteis(inicio: string, fim: string, config: Config, feriados: Record<string,string>): number {
+  let count = 0, d = inicio;
+  while (d <= fim) {
+    if (isDiaUtil(d, config, feriados)) count++;
+    d = addDiasStr(d, 1);
+  }
+  return count;
+}
+function totalDescontosFixos(config: Config): number {
+  return (Number(config.descontoVT)||0)
+    + (Number(config.descontoVA)||0)
+    + (Number(config.descontoVR)||0)
+    + (Number(config.descontoPlanoSaude)||0)
+    + (Number(config.descontoPlanoOdonto)||0)
+    + (Number(config.descontoOutros)||0);
+}
 function salarioLiquido(config: Config): number {
   const bruto = Number(config.salarioBruto)||0;
   const inss = calcINSS(bruto);
   const irrf = calcIRRF(bruto,inss);
-  return bruto - inss - irrf;
+  return bruto - inss - irrf - totalDescontosFixos(config);
 }
 function valorHoraLiquida(config: Config): number {
   const liq = salarioLiquido(config);
@@ -540,7 +605,19 @@ function TelaPonto({ config, registros, setRegistros, periodos, dark }: {
           {proxIdx >= 0 ? (
             <>
               <p className="text-xs text-slate-400 mb-1 uppercase tracking-widest">Próximo registro</p>
-              <p className={`text-lg font-bold mb-5 ${dark?"text-white":"text-slate-800"}`}>{NOMES_BATIDAS[proxIdx]}</p>
+              <p className={`text-lg font-bold mb-3 ${dark?"text-white":"text-slate-800"}`}>{NOMES_BATIDAS[proxIdx]}</p>
+              {/* Autocomplete de horário padrão */}
+              {padroes[proxIdx] && (
+                <button
+                  onClick={()=>{
+                    const novas=[...reg.batidas]; novas[proxIdx]=padroes[proxIdx];
+                    salvar({...reg,batidas:novas,editado:[...reg.editado.map((e,i)=>i===proxIdx?true:e)]});
+                    setPulso(true); setTimeout(()=>setPulso(false),600);
+                  }}
+                  className="mb-4 mx-auto flex items-center gap-2 px-4 py-1.5 rounded-full bg-slate-700/60 border border-slate-600 text-xs text-slate-300 hover:bg-blue-600/30 hover:border-blue-500 hover:text-white transition-all">
+                  <Ic n="clock" size={12}/> Usar horário padrão · {padroes[proxIdx]}
+                </button>
+              )}
               <button onClick={bater}
                 className={`relative w-32 h-32 rounded-full mx-auto flex items-center justify-center text-white font-bold shadow-2xl transition-all duration-200 active:scale-90
                   ${pulso?"scale-110 shadow-blue-500/60":"hover:scale-105"} bg-gradient-to-br from-blue-500 to-blue-700`}>
@@ -708,7 +785,7 @@ function TelaInicio({ config, registros, setRegistros, dark, abrirRelatorioPerio
   const bruto = Number(config.salarioBruto)||0;
   const inss = calcINSS(bruto);
   const irrf = calcIRRF(bruto,inss);
-  const liquido = bruto - inss - irrf;
+  const liquido = salarioLiquido(config);
 
   // Horas trabalhadas hoje para calcular por hora
   const hoje_d = new Date();
@@ -723,9 +800,23 @@ function TelaInicio({ config, registros, setRegistros, dark, abrirRelatorioPerio
 
   const periodoAtual = periodoFechamento(hoje, config.fechamentoDia);
   const diasPeriodoAtual = listarDias(periodoAtual.inicio, periodoAtual.fim, true, registros);
-  const resumoPeriodoAtual = resumoRegistros(diasPeriodoAtual, registros, config);
+  const feriadosPeriodo = getFeriados(new Date().getFullYear());
+  const resumoPeriodoAtual = resumoRegistros(diasPeriodoAtual, registros, config, feriadosPeriodo);
   const minPeriodo = resumoPeriodoAtual.considerado;
   const liquidoPorHora=valorHoraLiquida(config);
+
+  // Resumo mês atual
+  const mesAtual = periodoMes(new Date().getFullYear(), new Date().getMonth());
+  const diasMesAtual = listarDias(mesAtual.inicio, mesAtual.fim, false);
+  const diasUteisTotal = contarDiasUteis(mesAtual.inicio, hoje, config, feriadosPeriodo);
+  const diasMesComPonto = diasMesAtual.filter(d => d <= hoje && registros[d] && calcSaldo(registros[d].batidas, config) !== null).length;
+  const faltasMes = diasMesAtual.filter(d => d <= hoje && registros[d]?.ausencia === "falta").length;
+  const heMinMes = diasMesAtual.filter(d => d <= hoje && registros[d]).reduce((acc,d)=>{
+    const s = calcSaldo(registros[d].batidas, config);
+    return acc + (s !== null ? Math.max(0,s) : 0);
+  }, 0);
+  const valorHEMes = valorHoraExtra(heMinMes, config);
+  const estimativaMes = liquido + valorHEMes;
 
   // Calendário
   const primeiroDia=new Date(calAno,calMes,1).getDay();
@@ -784,6 +875,27 @@ function TelaInicio({ config, registros, setRegistros, dark, abrirRelatorioPerio
           </Card>
         ))}
       </div>
+
+      {/* Resumo Mensal */}
+      <Card cls={`p-5 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className={`font-semibold text-sm ${dark?"text-white":"text-slate-800"}`}>📊 Resumo do Mês</h3>
+          <span className="text-xs text-slate-400">{MESES[new Date().getMonth()]} {new Date().getFullYear()}</span>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          {[
+            {label:"Dias trabalhados", value:`${diasMesComPonto} / ${diasUteisTotal}`, color:"text-emerald-400"},
+            {label:"Faltas", value:faltasMes > 0 ? String(faltasMes) : "Nenhuma", color:faltasMes>0?"text-red-400":"text-slate-400"},
+            {label:"Horas extras", value:heMinMes>0?minToHHMM(heMinMes):"—", color:heMinMes>0?"text-blue-400":"text-slate-400"},
+            {label:"Estimativa líquida", value:liquido>0?`R$ ${estimativaMes.toLocaleString("pt-BR",{minimumFractionDigits:2})}`:"—", color:"text-emerald-400"},
+          ].map((item,i)=>(
+            <div key={i} className={`rounded-xl p-3 ${dark?"bg-slate-700/40":"bg-slate-50"}`}>
+              <p className="text-xs text-slate-400 mb-1">{item.label}</p>
+              <p className={`font-bold font-mono text-sm ${item.color}`}>{item.value}</p>
+            </div>
+          ))}
+        </div>
+      </Card>
 
       {/* Calendário */}
       <Card cls={`p-5 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
@@ -1028,10 +1140,13 @@ function calcLiquidoRec(r: Recebimento): number {
   const inss = Number(r.inss)||0;
   const irrf = Number(r.irrf)||0;
   const vt = Number(r.vt)||0;
+  const va = Number(r.va)||0;
   const vr = Number(r.vr)||0;
+  const planoSaude = Number(r.planoSaude)||0;
+  const planoOdonto = Number(r.planoOdonto)||0;
   const outros = Number(r.outros)||0;
   const adiant = Number(r.adiantamento)||0;
-  return bruto + horaExtra + acrescimos - inss - irrf - vt - vr - outros - adiant;
+  return bruto + horaExtra + acrescimos - inss - irrf - vt - va - vr - planoSaude - planoOdonto - outros - adiant;
 }
 
 function calcTotalMes(recs: Recebimento[], competencia: string): number {
@@ -1042,7 +1157,8 @@ function calcTotalMes(recs: Recebimento[], competencia: string): number {
 const FORM_VAZIO: Omit<Recebimento,"id"> = {
   dataRecebimento: "", competencia: "", tipo: "adiantamento",
   salario: "", horaExtra: "", acrescimos: "", acrescimosObs: "",
-  adiantamento: "", inss: "", irrf: "", vt: "", vr: "",
+  adiantamento: "", inss: "", irrf: "", vt: "", va: "", vr: "",
+  planoSaude: "", planoOdonto: "",
   outros: "", outrosObs: ""
 };
 
@@ -1063,7 +1179,7 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, periodos
   const [filtroFim, setFiltroFim] = useState("");
 
   const bruto=Number(config.salarioBruto)||0;
-  const inss=calcINSS(bruto), irrf=calcIRRF(bruto,inss), liquido=bruto-inss-irrf;
+  const inss=calcINSS(bruto), irrf=calcIRRF(bruto,inss), liquido=salarioLiquido(config);
   const rec=financeiro.recebimentos||[];
   const recFiltrados = rec.filter(r=>entreDatas(r.dataRecebimento || `${r.competencia}-01`, filtroInicio, filtroFim));
   const heFinanceiroMin = horasExtrasFinanceiras(periodos, registros, config, filtroInicio, filtroFim);
@@ -1081,7 +1197,25 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, periodos
     const comp = hoje.slice(0,7); // "YYYY-MM"
     const hint = tipo === "pagamento" ? getUltimoAdiantamento(comp) : "";
     setAdiantHint(hint);
-    setForm({...FORM_VAZIO, tipo, dataRecebimento: hoje, competencia: comp});
+    // Pré-preenche descontos fixos das configurações
+    const inssAuto = bruto ? String(calcINSS(bruto).toFixed(2)) : "";
+    const irrfAuto = bruto ? String(calcIRRF(bruto, calcINSS(bruto)).toFixed(2)) : "";
+    setForm({
+      ...FORM_VAZIO,
+      tipo,
+      dataRecebimento: hoje,
+      competencia: comp,
+      salario: config.salarioBruto || "",
+      inss: inssAuto,
+      irrf: irrfAuto,
+      vt: config.descontoVT || "",
+      va: config.descontoVA || "",
+      vr: config.descontoVR || "",
+      planoSaude: config.descontoPlanoSaude || "",
+      planoOdonto: config.descontoPlanoOdonto || "",
+      outros: config.descontoOutros || "",
+      outrosObs: config.descontoOutrosObs || "",
+    });
     setEditId(null);
     setShowForm(true);
   }
@@ -1092,7 +1226,8 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, periodos
       salario: r.salario, horaExtra: r.horaExtra||"",
       acrescimos: r.acrescimos||"", acrescimosObs: r.acrescimosObs||"",
       adiantamento: r.adiantamento,
-      inss: r.inss, irrf: r.irrf, vt: r.vt, vr: r.vr,
+      inss: r.inss, irrf: r.irrf, vt: r.vt, va: r.va||"", vr: r.vr,
+      planoSaude: r.planoSaude||"", planoOdonto: r.planoOdonto||"",
       outros: r.outros, outrosObs: r.outrosObs||""
     });
     setAdiantHint("");
@@ -1139,12 +1274,14 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, periodos
     ? competencias.reduce((a,c)=>a+calcTotalMes(recFiltrados,c),0)/competencias.length
     : liquido;
 
+  const descontosFixos = totalDescontosFixos(config);
   const dadosPizza=[
     {name:"INSS",value:Math.round(inss)},
     {name:"IRRF",value:Math.round(irrf)},
+    ...(descontosFixos>0?[{name:"Outros descontos",value:Math.round(descontosFixos)}]:[]),
     {name:"Líquido",value:Math.round(liquido)},
   ];
-  const CORES=["#ef4444","#f59e0b","#10b981"];
+  const CORES=["#ef4444","#f59e0b","#a855f7","#10b981"];
 
   const hoje_d=new Date();
   const dadosBH=Array.from({length:6},(_,i)=>{
@@ -1192,16 +1329,25 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, periodos
         <div className="space-y-4">
           <Card cls={`p-5 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
             <h3 className={`font-semibold mb-4 ${dark?"text-white":"text-slate-800"}`}>Simulação Salarial</h3>
-            {[
-              {label:"Salário Bruto",value:bruto,neg:false,color:"text-white"},
-              {label:`INSS`,value:inss,neg:true,color:"text-red-400"},
-              {label:`IRRF`,value:irrf,neg:true,color:"text-red-400"},
-            ].map((item,i)=>(
-              <div key={i} className={`flex justify-between py-2 ${i<2?(dark?"border-b border-slate-700/50":"border-b border-slate-200"):""}`}>
-                <span className="text-sm text-slate-400">{item.label}</span>
-                <span className={`font-mono font-bold ${item.color}`}>{item.neg?"-":""}R$ {item.value.toLocaleString("pt-BR",{minimumFractionDigits:2})}</span>
-              </div>
-            ))}
+            {(() => {
+              const linhas = [
+                {label:"Salário Bruto",value:bruto,neg:false,color:"text-white"},
+                {label:"INSS",value:inss,neg:true,color:"text-red-400"},
+                {label:"IRRF",value:irrf,neg:true,color:"text-red-400"},
+                ...(Number(config.descontoVT)>0?[{label:"Vale Transporte",value:Number(config.descontoVT),neg:true,color:"text-orange-400"}]:[]),
+                ...(Number(config.descontoVA)>0?[{label:"Vale Alimentação",value:Number(config.descontoVA),neg:true,color:"text-orange-400"}]:[]),
+                ...(Number(config.descontoVR)>0?[{label:"Vale Refeição",value:Number(config.descontoVR),neg:true,color:"text-orange-400"}]:[]),
+                ...(Number(config.descontoPlanoSaude)>0?[{label:"Plano de Saúde",value:Number(config.descontoPlanoSaude),neg:true,color:"text-purple-400"}]:[]),
+                ...(Number(config.descontoPlanoOdonto)>0?[{label:"Plano Odontológico",value:Number(config.descontoPlanoOdonto),neg:true,color:"text-purple-400"}]:[]),
+                ...(Number(config.descontoOutros)>0?[{label:config.descontoOutrosObs||"Outros descontos",value:Number(config.descontoOutros),neg:true,color:"text-slate-400"}]:[]),
+              ];
+              return linhas.map((item,i)=>(
+                <div key={i} className={`flex justify-between py-2 ${i<linhas.length-1?(dark?"border-b border-slate-700/50":"border-b border-slate-200"):""}`}>
+                  <span className="text-sm text-slate-400">{item.label}</span>
+                  <span className={`font-mono font-bold ${item.color}`}>{item.neg?"-":""}R$ {item.value.toLocaleString("pt-BR",{minimumFractionDigits:2})}</span>
+                </div>
+              ));
+            })()}
             <div className="flex justify-between py-3 px-3 mt-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
               <span className="font-semibold text-emerald-300">Salário Líquido Estimado</span>
               <span className="font-mono font-bold text-emerald-400 text-lg">R$ {liquido.toLocaleString("pt-BR",{minimumFractionDigits:2})}</span>
@@ -1412,7 +1558,10 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, periodos
                 {l:"INSS", v:viewRec.inss, pos:false, obs:""},
                 {l:"IRRF", v:viewRec.irrf, pos:false, obs:""},
                 {l:"Vale Transporte", v:viewRec.vt, pos:false, obs:""},
+                {l:"Vale Alimentação", v:viewRec.va||"0", pos:false, obs:""},
                 {l:"Vale Refeição", v:viewRec.vr, pos:false, obs:""},
+                {l:"Plano de Saúde", v:viewRec.planoSaude||"0", pos:false, obs:""},
+                {l:"Plano Odontológico", v:viewRec.planoOdonto||"0", pos:false, obs:""},
                 {l:"Adiantamento descontado", v:viewRec.adiantamento, pos:false, obs:""},
                 {l:"Outros descontos", v:viewRec.outros, pos:false, obs:viewRec.outrosObs||""},
               ].filter(i=>Number(i.v)>0).map((item,i)=>(
@@ -1497,7 +1646,10 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, periodos
                 <Inp label="INSS (R$)" type="number" value={form.inss} onChange={v=>setForm(p=>({...p,inss:v}))}/>
                 <Inp label="IRRF (R$)" type="number" value={form.irrf} onChange={v=>setForm(p=>({...p,irrf:v}))}/>
                 <Inp label="Vale Transp. (R$)" type="number" value={form.vt} onChange={v=>setForm(p=>({...p,vt:v}))}/>
+                <Inp label="Vale Alim. (R$)" type="number" value={form.va||""} onChange={v=>setForm(p=>({...p,va:v}))}/>
                 <Inp label="Vale Refei. (R$)" type="number" value={form.vr} onChange={v=>setForm(p=>({...p,vr:v}))}/>
+                <Inp label="Plano Saúde (R$)" type="number" value={form.planoSaude||""} onChange={v=>setForm(p=>({...p,planoSaude:v}))}/>
+                <Inp label="Plano Odonto (R$)" type="number" value={form.planoOdonto||""} onChange={v=>setForm(p=>({...p,planoOdonto:v}))}/>
               </div>
               <Inp label="Outros descontos (R$)" type="number" value={form.outros} onChange={v=>setForm(p=>({...p,outros:v}))}/>
               {(Number(form.outros)>0) && (
@@ -1675,11 +1827,96 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
     setExpandido("aberto");
   }
 
+  async function gerarPDF(dias: string[], titulo: string) {
+    const { jsPDF } = await import("jspdf");
+    const doc = new jsPDF({ orientation:"portrait", unit:"mm", format:"a4" });
+    const W = 210, M = 14;
+    let y = 18;
+
+    // Header
+    doc.setFillColor(30,64,175);
+    doc.rect(0,0,W,28,"F");
+    doc.setTextColor(255,255,255);
+    doc.setFontSize(16); doc.setFont("helvetica","bold");
+    doc.text("MeuPonto · Espelho de Ponto", M, 11);
+    doc.setFontSize(9); doc.setFont("helvetica","normal");
+    doc.text(`${config.nome || "Funcionário"} · ${config.empresa || "Empresa"} · ${config.cargo || ""}`, M, 18);
+    doc.text(`Gerado em ${new Date().toLocaleDateString("pt-BR")}   Período: ${titulo}`, M, 24);
+    y = 35;
+
+    // Dados funcionário
+    doc.setTextColor(30,30,30);
+    doc.setFontSize(8); doc.setFont("helvetica","normal");
+    const admStr = config.admissao ? `Admissão: ${config.admissao.split("-").reverse().join("/")}` : "";
+    doc.text([`Salário Bruto: R$ ${Number(config.salarioBruto||0).toLocaleString("pt-BR",{minimumFractionDigits:2})}   ${admStr}`], M, y);
+    y += 7;
+
+    // Cabeçalho tabela
+    const cols = [M, 38, 56, 70, 84, 100, 118, 145, 170];
+    const headers = ["Data","Dia","Entrada","S.Almoço","V.Almoço","Saída","Saldo","Ocorrência","Obs"];
+    doc.setFillColor(241,245,249);
+    doc.rect(M-2, y-4, W-M*2+4, 7, "F");
+    doc.setFontSize(7.5); doc.setFont("helvetica","bold"); doc.setTextColor(80,80,80);
+    headers.forEach((h,i) => doc.text(h, cols[i], y));
+    y += 5;
+
+    // Linhas
+    let totalExtras = 0, totalNeg = 0, diasComPonto = 0, faltas = 0;
+    const diasSemana = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
+    dias.forEach((dia, idx) => {
+      const r = registros[dia];
+      if (!r) return;
+      const [b0,b1,b2,b3] = r.batidas;
+      const saldo = calcSaldo(r.batidas, config);
+      if (saldo !== null) { diasComPonto++; if(saldo>=0) totalExtras+=saldo; else totalNeg+=saldo; }
+      if (r.ausencia==="falta") faltas++;
+      const dObj = strParaData(dia);
+      const dSemana = diasSemana[dObj.getDay()];
+      const dataFmt = dia.split("-").slice(1).reverse().join("/") + `/${dia.slice(2,4)}`;
+      const saldoStr = saldo !== null ? (saldo>=0?"+":"")+minToHHMM(saldo) : r.ausencia || "—";
+
+      if (idx % 2 === 0) {
+        doc.setFillColor(249,250,251);
+        doc.rect(M-2, y-3.5, W-M*2+4, 6, "F");
+      }
+      doc.setFont("helvetica","normal"); doc.setFontSize(7.5); doc.setTextColor(30,30,30);
+      doc.text(dataFmt, cols[0], y);
+      doc.text(dSemana, cols[1], y);
+      doc.text(b0||"—", cols[2], y);
+      doc.text(b1||"—", cols[3], y);
+      doc.text(b2||"—", cols[4], y);
+      doc.text(b3||"—", cols[5], y);
+      if (saldo !== null) {
+        doc.setTextColor(saldo>=0?22:220, saldo>=0?163:38, saldo>=0?74:38);
+      } else {
+        doc.setTextColor(150,100,0);
+      }
+      doc.text(saldoStr, cols[6], y);
+      doc.setTextColor(30,30,30);
+      doc.text(r.ausencia ? r.ausencia : "", cols[7], y);
+      if (r.observacao) doc.text(r.observacao.slice(0,20), cols[8], y);
+      y += 6;
+      if (y > 270) { doc.addPage(); y = 18; }
+    });
+
+    // Rodapé resumo
+    y += 4;
+    doc.setFillColor(30,64,175);
+    doc.rect(M-2, y-4, W-M*2+4, 7, "F");
+    doc.setTextColor(255,255,255); doc.setFont("helvetica","bold"); doc.setFontSize(8);
+    doc.text(`Dias com ponto: ${diasComPonto}   Faltas: ${faltas}   HE: +${minToHHMM(totalExtras)}   Negativo: ${minToHHMM(totalNeg)}   Saldo: ${minToHHMM(totalExtras+totalNeg)}`, M, y);
+
+    doc.save(`espelho-ponto-${titulo.replace(/\s+/g,"-")}.pdf`);
+  }
+
   return (
     <div className="space-y-4 pb-6">
       <div className="flex justify-between items-center">
         <h2 className={`text-xl font-bold ${dark?"text-white":"text-slate-800"}`}>Relatório</h2>
-        <Btn onClick={()=>setShowFechar(true)} v="warning" sz="sm"><Ic n="lock" size={14}/>Fechar Período</Btn>
+        <div className="flex gap-2">
+          <Btn onClick={()=>{ const t=diasAbertos[0]&&diasAbertos[diasAbertos.length-1]?`${diasAbertos[0]}-a-${diasAbertos[diasAbertos.length-1]}`:"atual"; gerarPDF(diasAbertos, t); }} v="ghost" sz="sm"><Ic n="download" size={14}/>PDF</Btn>
+          <Btn onClick={()=>setShowFechar(true)} v="warning" sz="sm"><Ic n="lock" size={14}/>Fechar Período</Btn>
+        </div>
       </div>
 
       <Card cls={`p-3 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
@@ -1768,6 +2005,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
                 <div className="flex gap-2">
                   <Inp label="Hora Extra RH" type="number" value={periodo.horaExtraRH||""} onChange={v=>setPeriodos(prev=>prev.map(p=>p.id===periodo.id?{...p,horaExtraRH:v}:p))} hint="Horas oficiais consideradas pelo RH"/>
                   <Btn onClick={()=>reabrirPeriodo(periodo.id)} v="secondary" sz="sm" cls="self-end mb-5">Reabrir</Btn>
+                  <Btn onClick={()=>gerarPDF(diasPeriodo, `${periodo.inicio}-a-${periodo.fim}`)} v="ghost" sz="sm" cls="self-end mb-5"><Ic n="download" size={13}/>PDF</Btn>
                 </div>
                 {diasPeriodo.map(dia=>{
                   const r=registros[dia];
@@ -1866,6 +2104,202 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
 // ============================================================
 // TELA: FÉRIAS
 // ============================================================
+
+// ============================================================
+// TELA 13º SALÁRIO
+// ============================================================
+function TelaDecimoTerceiro({ config, dark }: { config: Config; dark: boolean }) {
+  const LS_KEY = "meu_ponto_decimo";
+  const [pagamentos, setPagamentos] = useState<DecimoTerceiroPagamento[]>(() => {
+    try { return JSON.parse(localStorage.getItem(LS_KEY)||"[]"); } catch { return []; }
+  });
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState<Omit<DecimoTerceiroPagamento,"id">>({data:"",parcela:"1a",valor:"",obs:""});
+
+  useEffect(()=>{ localStorage.setItem(LS_KEY, JSON.stringify(pagamentos)); },[pagamentos]);
+
+  const anoAtual = new Date().getFullYear();
+  const mesAtual = new Date().getMonth(); // 0-based
+
+  // Meses trabalhados no ano (1 a 12, conta mês completo se ≥ 15 dias)
+  const admissao = config.admissao;
+  function mesesTrabalhados(ano: number): number {
+    if (!admissao) return mesAtual + 1;
+    const adm = new Date(admissao + "T00:00:00");
+    const admAno = adm.getFullYear();
+    const admMes = adm.getMonth();
+    if (admAno > ano) return 0;
+    const inicio = admAno === ano ? admMes : 0;
+    const fim = mesAtual; // até o mês atual
+    let total = 0;
+    for (let m = inicio; m <= fim; m++) {
+      if (admAno === ano && m === admMes) {
+        // conta se ingressou até dia 15
+        if (adm.getDate() <= 15) total++;
+      } else {
+        total++;
+      }
+    }
+    return Math.min(total, 12);
+  }
+
+  const meses = mesesTrabalhados(anoAtual);
+  const bruto = Number(config.salarioBruto)||0;
+  const decimoBruto = bruto * meses / 12;
+  const decimoInss = calcINSS(decimoBruto);
+  const decimoIrrf = calcIRRF(decimoBruto, decimoInss);
+  const decimoLiquido = decimoBruto - decimoInss - decimoIrrf;
+  const provisaoMensal = bruto / 12;
+
+  // Pagamentos do ano atual
+  const pgsAno = pagamentos.filter(p => p.data.startsWith(String(anoAtual)));
+  const pago1a = pgsAno.find(p=>p.parcela==="1a");
+  const pago2a = pgsAno.find(p=>p.parcela==="2a");
+  const totalPago = pgsAno.reduce((acc,p)=>acc+(Number(p.valor)||0),0);
+
+  function salvarPgto() {
+    if (!form.data || !form.valor) return;
+    setPagamentos(prev=>[...prev,{...form,id:Date.now()}]);
+    setForm({data:"",parcela:"1a",valor:"",obs:""}); setShowForm(false);
+  }
+
+  function remover(id: number) { setPagamentos(prev=>prev.filter(p=>p.id!==id)); }
+
+  const progresso = Math.min(100, (meses/12)*100);
+
+  return (
+    <div className="space-y-4 pb-6">
+      <Card cls={`p-5 border-yellow-500/20 ${dark?"bg-gradient-to-br from-yellow-900/30 to-slate-900/60":"bg-gradient-to-br from-yellow-50 to-white"}`}>
+        <div className="flex items-center gap-3 mb-4">
+          <span className="text-2xl">🎁</span>
+          <div>
+            <h2 className={`text-lg font-bold ${dark?"text-white":"text-slate-800"}`}>13º Salário {anoAtual}</h2>
+            <p className="text-xs text-slate-400">Provisão e acompanhamento</p>
+          </div>
+        </div>
+        {/* Barra de progresso */}
+        <div className="mb-3">
+          <div className="flex justify-between text-xs text-slate-400 mb-1">
+            <span>{meses} {meses===1?"mês":"meses"} trabalhados</span>
+            <span>{Math.round(progresso)}%</span>
+          </div>
+          <div className={`w-full h-2.5 rounded-full ${dark?"bg-slate-700":"bg-slate-200"}`}>
+            <div className="h-2.5 rounded-full bg-gradient-to-r from-yellow-500 to-orange-400 transition-all duration-500"
+              style={{width:`${progresso}%`}}/>
+          </div>
+          <div className="flex justify-between text-xs text-slate-500 mt-1">
+            <span>Jan</span><span>Dez</span>
+          </div>
+        </div>
+        {/* Valores */}
+        <div className="grid grid-cols-2 gap-2 mt-4">
+          {[
+            {l:"Bruto proporcional", v:`R$ ${decimoBruto.toLocaleString("pt-BR",{minimumFractionDigits:2})}`, c:"text-yellow-400"},
+            {l:"Líquido estimado", v:`R$ ${decimoLiquido.toLocaleString("pt-BR",{minimumFractionDigits:2})}`, c:"text-emerald-400"},
+            {l:"Provisão/mês", v:bruto?`R$ ${provisaoMensal.toLocaleString("pt-BR",{minimumFractionDigits:2})}`:"—", c:"text-blue-400"},
+            {l:"Total pago em "+anoAtual, v:totalPago>0?`R$ ${totalPago.toLocaleString("pt-BR",{minimumFractionDigits:2})}`:"Nenhum", c:totalPago>0?"text-emerald-400":"text-slate-500"},
+          ].map((item,i)=>(
+            <div key={i} className={`rounded-xl p-3 ${dark?"bg-slate-700/40":"bg-slate-50"}`}>
+              <p className="text-xs text-slate-400 mb-1">{item.l}</p>
+              <p className={`font-bold font-mono text-sm ${item.c}`}>{item.v}</p>
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      {/* Parcelas */}
+      <Card cls={`p-5 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
+        <div className="flex justify-between items-center mb-3">
+          <h3 className={`font-semibold ${dark?"text-white":"text-slate-800"}`}>Parcelas {anoAtual}</h3>
+          <button onClick={()=>setShowForm(true)}
+            className="text-xs px-3 py-1.5 rounded-xl bg-yellow-600 text-white font-medium hover:bg-yellow-500 transition-all">
+            + Registrar
+          </button>
+        </div>
+        <div className="space-y-2">
+          {[
+            {parcela:"1a" as const, label:"1ª Parcela", prazo:"30/11", pago:pago1a},
+            {parcela:"2a" as const, label:"2ª Parcela", prazo:"20/12", pago:pago2a},
+          ].map(item=>(
+            <div key={item.parcela} className={`flex justify-between items-center p-3 rounded-xl ${dark?"bg-slate-700/40":"bg-slate-50"}`}>
+              <div>
+                <p className={`text-sm font-medium ${dark?"text-white":"text-slate-800"}`}>{item.label}</p>
+                <p className="text-xs text-slate-500">Prazo: {item.prazo}/{anoAtual}</p>
+              </div>
+              {item.pago ? (
+                <div className="text-right">
+                  <p className="text-sm font-bold text-emerald-400 font-mono">R$ {Number(item.pago.valor).toLocaleString("pt-BR",{minimumFractionDigits:2})}</p>
+                  <p className="text-xs text-slate-500">{item.pago.data.split("-").reverse().join("/")}</p>
+                </div>
+              ) : (
+                <span className={`text-xs px-2 py-1 rounded-full ${dark?"bg-slate-600 text-slate-300":"bg-slate-200 text-slate-500"}`}>Pendente</span>
+              )}
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      {/* Histórico de pagamentos */}
+      {pagamentos.length > 0 && (
+        <Card cls={`p-5 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
+          <h3 className={`font-semibold mb-3 ${dark?"text-white":"text-slate-800"}`}>Histórico</h3>
+          <div className="space-y-2">
+            {pagamentos.slice().sort((a,b)=>b.data.localeCompare(a.data)).map(p=>(
+              <div key={p.id} className={`flex justify-between items-start p-3 rounded-xl ${dark?"bg-slate-700/40":"bg-slate-50"}`}>
+                <div>
+                  <p className={`text-sm font-medium ${dark?"text-white":"text-slate-700"}`}>
+                    {p.parcela==="1a"?"1ª Parcela":"2ª Parcela"} · {p.data.slice(0,4)}
+                  </p>
+                  {p.obs && <p className="text-xs text-slate-500 mt-0.5">{p.obs}</p>}
+                  <p className="text-xs text-slate-500">{p.data.split("-").reverse().join("/")}</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="font-mono font-bold text-emerald-400 text-sm">R$ {Number(p.valor).toLocaleString("pt-BR",{minimumFractionDigits:2})}</span>
+                  <button onClick={()=>remover(p.id)} className="text-slate-500 hover:text-red-400 transition-colors">
+                    <Ic n="x" size={14}/>
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {/* Formulário de registro */}
+      {showForm && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 backdrop-blur-sm" onClick={e=>{if(e.target===e.currentTarget)setShowForm(false)}}>
+          <div className={`w-full max-w-md rounded-t-3xl p-6 space-y-4 ${dark?"bg-slate-900":"bg-white"}`}>
+            <div className="flex justify-between items-center">
+              <h3 className={`font-bold text-lg ${dark?"text-white":"text-slate-800"}`}>Registrar 13º Recebido</h3>
+              <button onClick={()=>setShowForm(false)} className="text-slate-400 hover:text-white"><Ic n="x" size={20}/></button>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <Inp label="Data" type="date" value={form.data} onChange={v=>setForm(p=>({...p,data:v}))}/>
+              <Inp label="Valor (R$)" type="number" value={form.valor} onChange={v=>setForm(p=>({...p,valor:v}))}/>
+            </div>
+            <div>
+              <label className="text-xs font-medium text-slate-400 uppercase tracking-wide block mb-1">Parcela</label>
+              <div className="flex gap-2">
+                {(["1a","2a"] as const).map(p=>(
+                  <button key={p} onClick={()=>setForm(prev=>({...prev,parcela:p}))}
+                    className={`flex-1 py-2 rounded-xl text-sm font-medium border transition-all ${form.parcela===p?"bg-yellow-600 border-yellow-500 text-white":dark?"border-slate-700 text-slate-400 hover:border-slate-600":"border-slate-200 text-slate-500"}`}>
+                    {p==="1a"?"1ª Parcela":"2ª Parcela"}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <Inp label="Observação (opcional)" value={form.obs} onChange={v=>setForm(p=>({...p,obs:v}))}/>
+            <button onClick={salvarPgto} disabled={!form.data||!form.valor}
+              className="w-full py-3 rounded-2xl bg-yellow-600 text-white font-bold disabled:opacity-40 hover:bg-yellow-500 transition-all">
+              Salvar
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TelaFerias({ config, ferias, setFerias, dark }: {
   config: Config; ferias: {historico:FeriasRegistro[]};
   setFerias: React.Dispatch<React.SetStateAction<{historico:FeriasRegistro[]}>>; dark: boolean;
@@ -1887,7 +2321,7 @@ function TelaFerias({ config, ferias, setFerias, dark }: {
   const diasTirados=(ferias.historico||[]).reduce((a,f)=>a+Math.round((new Date(f.fim).getTime()-new Date(f.inicio).getTime())/(1000*60*60*24))+1,0);
   const diasDisp=Math.max(0,diasAdq-diasTirados);
   const bruto=Number(config.salarioBruto)||0;
-  const inss=calcINSS(bruto), irrf=calcIRRF(bruto,inss), liq=bruto-inss-irrf;
+  const inss=calcINSS(bruto), irrf=calcIRRF(bruto,inss), liq=salarioLiquido(config);
   const valorFerias=liq+(liq/3);
   const valorRecebido=(ferias.historico||[]).reduce((acc,f)=>acc+(Number(f.valorRecebido)||0),0);
   const valorRestante=Math.max(0,valorFerias-valorRecebido);
@@ -2011,6 +2445,8 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
   const [showNovaNotif, setShowNovaNotif] = useState(false);
   const [pushStatus, setPushStatus] = useState("Verificando...");
   const [pushSubscription, setPushSubscription] = useState<PushSubscription|null>(null);
+  const [showHistSalario, setShowHistSalario] = useState(false);
+  const [formHist, setFormHist] = useState<Omit<SalarioHistorico,"id">>({dataInicio:"",valor:"",obs:""});
 
   function iniciarEdicao() { setRascunho(config); setEditando(true); }
   function salvar() { setConfig(rascunho); setEditando(false); }
@@ -2100,11 +2536,11 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
       </div>
 
       <div className={`flex gap-1 p-1 rounded-xl ${dark?"bg-slate-800/50":"bg-slate-100"}`}>
-        {["perfil","escala","notif"].map(a=>(
+        {["perfil","escala","descontos","notif"].map(a=>(
           <button key={a} onClick={()=>setAba(a)}
-            className={`flex-1 py-2 text-xs font-medium rounded-lg capitalize transition-all duration-200
+            className={`flex-1 py-1.5 text-xs font-medium rounded-lg capitalize transition-all duration-200
               ${aba===a?"bg-blue-600 text-white shadow":dark?"text-slate-400 hover:text-white":"text-slate-500"}`}>
-            {a==="notif"?"Notificações":a.charAt(0).toUpperCase()+a.slice(1)}
+            {a==="notif"?"Notif.":a==="descontos"?"Descontos":a.charAt(0).toUpperCase()+a.slice(1)}
           </button>
         ))}
       </div>
@@ -2143,6 +2579,68 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
                 <Campo label="Dia Adiantamento" value={config.adiantamentoDia?`Dia ${config.adiantamentoDia}`:""}/>
                 <Campo label="Adicional HE" value={`${config.adicionalHE}%`}/>
                 <Campo label="Tolerância" value={`${config.tolerancia}min (${config.toleranciaTipo==="marcacao"?"por marcação":"por dia"})`}/>
+              </div>
+            </div>
+          )}
+        </Card>
+      )}
+
+      {aba==="perfil" && (
+        <Card cls={`p-5 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
+          <div className="flex justify-between items-center mb-3">
+            <h3 className={`font-semibold ${dark?"text-white":"text-slate-800"}`}>📈 Histórico de Salários</h3>
+            <button onClick={()=>setShowHistSalario(true)}
+              className="text-xs px-3 py-1.5 rounded-xl bg-blue-600 text-white font-medium hover:bg-blue-500 transition-all">
+              + Registrar reajuste
+            </button>
+          </div>
+          {((config.salarioHistorico||[]).length === 0) ? (
+            <p className="text-slate-500 text-sm italic">Nenhum reajuste registrado. O salário atual é o vigente desde sempre.</p>
+          ) : (
+            <div className="space-y-2">
+              {(config.salarioHistorico||[]).slice().sort((a,b)=>b.dataInicio.localeCompare(a.dataInicio)).map(h=>(
+                <div key={h.id} className={`flex justify-between items-start p-3 rounded-xl ${dark?"bg-slate-700/40":"bg-slate-50"}`}>
+                  <div>
+                    <p className={`text-sm font-medium ${dark?"text-white":"text-slate-800"}`}>
+                      R$ {Number(h.valor).toLocaleString("pt-BR",{minimumFractionDigits:2})}
+                    </p>
+                    <p className="text-xs text-slate-500">A partir de {h.dataInicio.split("-").reverse().join("/")}</p>
+                    {h.obs && <p className="text-xs text-slate-500">{h.obs}</p>}
+                  </div>
+                  <button onClick={()=>{
+                    const novo = {...config, salarioHistorico:(config.salarioHistorico||[]).filter(x=>x.id!==h.id)};
+                    setConfig(novo);
+                  }} className="text-slate-500 hover:text-red-400 transition-colors mt-1"><Ic n="x" size={14}/></button>
+                </div>
+              ))}
+            </div>
+          )}
+          {/* Form modal */}
+          {showHistSalario && (
+            <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 backdrop-blur-sm" onClick={e=>{if(e.target===e.currentTarget)setShowHistSalario(false)}}>
+              <div className={`w-full max-w-md rounded-t-3xl p-6 space-y-4 ${dark?"bg-slate-900":"bg-white"}`}>
+                <div className="flex justify-between items-center">
+                  <h3 className={`font-bold text-lg ${dark?"text-white":"text-slate-800"}`}>Registrar Reajuste</h3>
+                  <button onClick={()=>setShowHistSalario(false)} className="text-slate-400 hover:text-white"><Ic n="x" size={20}/></button>
+                </div>
+                <p className="text-xs text-slate-400">Registre o salário que era vigente antes do atual. Isso permite cálculos retroativos corretos.</p>
+                <div className="grid grid-cols-2 gap-3">
+                  <Inp label="Válido a partir de" type="date" value={formHist.dataInicio} onChange={v=>setFormHist(p=>({...p,dataInicio:v}))}/>
+                  <Inp label="Salário bruto (R$)" type="number" value={formHist.valor} onChange={v=>setFormHist(p=>({...p,valor:v}))}/>
+                </div>
+                <Inp label="Observação (opcional)" value={formHist.obs} onChange={v=>setFormHist(p=>({...p,obs:v}))} placeholder="Ex: Reajuste por mérito"/>
+                <button
+                  onClick={()=>{
+                    if(!formHist.dataInicio||!formHist.valor) return;
+                    const novo: SalarioHistorico = {...formHist, id:Date.now()};
+                    setConfig(prev=>({...prev, salarioHistorico:[...(prev.salarioHistorico||[]),novo]}));
+                    setFormHist({dataInicio:"",valor:"",obs:""});
+                    setShowHistSalario(false);
+                  }}
+                  disabled={!formHist.dataInicio||!formHist.valor}
+                  className="w-full py-3 rounded-2xl bg-blue-600 text-white font-bold disabled:opacity-40 hover:bg-blue-500 transition-all">
+                  Salvar
+                </button>
               </div>
             </div>
           )}
@@ -2255,6 +2753,77 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
             </div>
           )}
         </div>
+      )}
+
+
+      {aba==="descontos" && (
+        <Card cls={`p-5 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
+          <h3 className={`font-semibold mb-1 ${dark?"text-white":"text-slate-800"}`}>Descontos Fixos Mensais</h3>
+          <p className="text-xs text-slate-400 mb-4">Esses valores serão descontados automaticamente na simulação salarial e pré-preenchidos ao registrar recebimentos.</p>
+          {editando ? (
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <Inp label="Vale Transporte (R$)" type="number" value={rascunho.descontoVT} onChange={v=>upd("descontoVT",v)} placeholder="0,00"/>
+                <Inp label="Vale Alimentação (R$)" type="number" value={rascunho.descontoVA} onChange={v=>upd("descontoVA",v)} placeholder="0,00"/>
+                <Inp label="Vale Refeição (R$)" type="number" value={rascunho.descontoVR} onChange={v=>upd("descontoVR",v)} placeholder="0,00"/>
+                <Inp label="Plano de Saúde (R$)" type="number" value={rascunho.descontoPlanoSaude} onChange={v=>upd("descontoPlanoSaude",v)} placeholder="0,00"/>
+                <Inp label="Plano Odontológico (R$)" type="number" value={rascunho.descontoPlanoOdonto} onChange={v=>upd("descontoPlanoOdonto",v)} placeholder="0,00"/>
+                <Inp label="Outros descontos (R$)" type="number" value={rascunho.descontoOutros} onChange={v=>upd("descontoOutros",v)} placeholder="0,00"/>
+              </div>
+              {(Number(rascunho.descontoOutros)>0) && (
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-medium text-slate-400 uppercase tracking-wide">Descrição dos outros descontos</label>
+                  <textarea value={rascunho.descontoOutrosObs} onChange={e=>upd("descontoOutrosObs",e.target.value)}
+                    placeholder="Ex: Cooperativa, Empréstimo consignado..." rows={2}
+                    className="bg-slate-800/50 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 resize-none transition-all"/>
+                </div>
+              )}
+              {(() => {
+                const total = (Number(rascunho.descontoVT)||0)+(Number(rascunho.descontoVA)||0)+(Number(rascunho.descontoVR)||0)+(Number(rascunho.descontoPlanoSaude)||0)+(Number(rascunho.descontoPlanoOdonto)||0)+(Number(rascunho.descontoOutros)||0);
+                if (!total) return null;
+                return (
+                  <div className="flex justify-between py-2 px-3 rounded-xl bg-red-500/10 border border-red-500/20 mt-2">
+                    <span className="text-sm text-red-300 font-semibold">Total descontos fixos</span>
+                    <span className="font-mono font-bold text-red-400">- R$ {total.toLocaleString("pt-BR",{minimumFractionDigits:2})}</span>
+                  </div>
+                );
+              })()}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {[
+                {l:"Vale Transporte", v:config.descontoVT},
+                {l:"Vale Alimentação", v:config.descontoVA},
+                {l:"Vale Refeição", v:config.descontoVR},
+                {l:"Plano de Saúde", v:config.descontoPlanoSaude},
+                {l:"Plano Odontológico", v:config.descontoPlanoOdonto},
+                {l:config.descontoOutrosObs||"Outros descontos", v:config.descontoOutros},
+              ].filter(i=>Number(i.v)>0).length === 0 ? (
+                <p className="text-slate-500 text-sm italic">Nenhum desconto fixo configurado.</p>
+              ) : (
+                <>
+                  {[
+                    {l:"Vale Transporte", v:config.descontoVT},
+                    {l:"Vale Alimentação", v:config.descontoVA},
+                    {l:"Vale Refeição", v:config.descontoVR},
+                    {l:"Plano de Saúde", v:config.descontoPlanoSaude},
+                    {l:"Plano Odontológico", v:config.descontoPlanoOdonto},
+                    {l:config.descontoOutrosObs||"Outros descontos", v:config.descontoOutros},
+                  ].filter(i=>Number(i.v)>0).map((item,i)=>(
+                    <div key={i} className="flex justify-between py-2 border-b border-slate-700/30 last:border-0">
+                      <span className="text-sm text-slate-400">{item.l}</span>
+                      <span className="font-mono font-bold text-red-400">- R$ {Number(item.v).toLocaleString("pt-BR",{minimumFractionDigits:2})}</span>
+                    </div>
+                  ))}
+                  <div className="flex justify-between py-2 px-3 rounded-xl bg-red-500/10 border border-red-500/20 mt-1">
+                    <span className="text-sm text-red-300 font-semibold">Total</span>
+                    <span className="font-mono font-bold text-red-400">- R$ {totalDescontosFixos(config).toLocaleString("pt-BR",{minimumFractionDigits:2})}</span>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </Card>
       )}
 
       {/* Botão salvar fixo quando editando */}
@@ -2370,6 +2939,47 @@ export default function MeuPonto() {
   },[]);
   useEffect(()=>{ setConfig(p=>({...p,darkMode:dark})); },[dark]);
 
+  // Resumo semanal — dispara toda sexta-feira via SW
+  useEffect(()=>{
+    const hoje = new Date();
+    if (hoje.getDay() !== 5) return; // só sexta
+    const chave = `mp_resumo_semanal_${hoje.toISOString().slice(0,10)}`;
+    if (localStorage.getItem(chave)) return; // já enviou hoje
+    if (!("serviceWorker" in navigator)) return;
+    navigator.serviceWorker.ready.then(reg => {
+      if (!reg.active) return;
+      // Calcula saldo da semana atual
+      const diasSem: string[] = [];
+      for (let i=0; i<7; i++) {
+        const d = new Date(hoje); d.setDate(hoje.getDate()-hoje.getDay()+i);
+        diasSem.push(d.toISOString().slice(0,10));
+      }
+      try {
+        const regs: Record<string,{batidas:(string|null)[]; ausencia:string}> = JSON.parse(localStorage.getItem("mp_registros_v2")||"{}");
+        const cfg: Config = JSON.parse(localStorage.getItem("mp_config_v2")||"{}");
+        let saldo=0, extras=0, faltas=0;
+        diasSem.forEach(d=>{
+          const r=regs[d]; if(!r) return;
+          const s=calcSaldo(r.batidas as (string|null)[], cfg as Config);
+          if(s!==null){saldo+=s; if(s>0) extras+=s;}
+          if(r.ausencia==="falta") faltas++;
+        });
+        reg.active.postMessage({type:"RESUMO_SEMANAL", saldo, extras, faltas, nome: cfg.nome||""});
+        localStorage.setItem(chave, "1");
+      } catch {}
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // PWA: lê parâmetro de URL para abrir tela direta (shortcuts do manifest)
+  useEffect(()=>{
+    const params = new URLSearchParams(window.location.search);
+    const tela = params.get("tela");
+    if (tela && ["ponto","inicio","financeiro","relatorio","ferias","decimo","config","backup"].includes(tela)) {
+      setAba(tela);
+    }
+  },[]);
+
   // Todas as abas possíveis (nav + drawer)
   const navItems = [
     {key:"inicio", icon:"home", label:"Início"},
@@ -2380,6 +2990,7 @@ export default function MeuPonto() {
   const drawerItems = [
     {key:"relatorio", icon:"file", label:"Relatório"},
     {key:"ferias", icon:"beach", label:"Férias"},
+    {key:"decimo", icon:"dollar", label:"13º Salário"},
     {key:"config", icon:"settings", label:"Configurações"},
     {key:"backup", icon:"download", label:"Backup"},
   ];
@@ -2441,6 +3052,7 @@ export default function MeuPonto() {
         {aba==="financeiro" && <TelaFinanceiro config={config} registros={registros} financeiro={financeiro} setFinanceiro={setFinanceiro} periodos={periodos} dark={dark}/>}
         {aba==="relatorio" && <TelaRelatorio config={config} registros={registros} setRegistros={setRegistros} periodos={periodos} setPeriodos={setPeriodos} financeiro={financeiro} dark={dark} filtroInicial={filtroRelatorio}/>}
         {aba==="ferias" && <TelaFerias config={config} ferias={ferias} setFerias={setFerias} dark={dark}/>}
+        {aba==="decimo" && <TelaDecimoTerceiro config={config} dark={dark}/>}
         {aba==="config" && <TelaConfig config={config} setConfig={setConfig} dark={dark} setDark={setDark}/>}
         {aba==="backup" && <TelaBackup config={config} setConfig={setConfig} registros={registros} setRegistros={setRegistros} financeiro={financeiro} setFinanceiro={setFinanceiro} ferias={ferias} setFerias={setFerias} periodos={periodos} setPeriodos={setPeriodos} dark={dark}/>}
       </main>

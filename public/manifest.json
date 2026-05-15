@@ -6,8 +6,29 @@
   "display": "standalone",
   "background_color": "#0F172A",
   "theme_color": "#1E40AF",
+  "orientation": "portrait",
+  "categories": ["productivity", "business"],
   "icons": [
-    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
-    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" }
-  ]
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ],
+  "shortcuts": [
+    {
+      "name": "Bater Ponto",
+      "short_name": "Ponto",
+      "description": "Registrar ponto agora",
+      "url": "/?tela=ponto",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Ver Saldo",
+      "short_name": "Saldo",
+      "description": "Ver saldo do dia",
+      "url": "/?tela=inicio",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    }
+  ],
+  "screenshots": [],
+  "related_applications": [],
+  "prefer_related_applications": false
 }
