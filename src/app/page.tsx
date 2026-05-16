@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import { useAuth } from "@/lib/AuthContext";
+import { useFirestoreSync } from "@/lib/useFirestoreSync";
 import {
   LineChart, Line, PieChart, Pie, Cell, BarChart, Bar,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend
@@ -2924,11 +2926,16 @@ function TelaBackup({ config, setConfig, registros, setRegistros, financeiro, se
 // APP PRINCIPAL
 // ============================================================
 export default function MeuPonto() {
-  const [config, setConfig] = useLocalStorage<Config>("mp_config_v2", DEFAULT_CONFIG);
-  const [registros, setRegistros] = useLocalStorage<Record<string,RegistroDia>>("mp_registros_v2", {});
-  const [financeiro, setFinanceiro] = useLocalStorage<{recebimentos:Recebimento[]}>("mp_financeiro_v2", {recebimentos:[]});
-  const [ferias, setFerias] = useLocalStorage<{historico:FeriasRegistro[]}>("mp_ferias_v2", {historico:[]});
-  const [periodos, setPeriodos] = useLocalStorage<Periodo[]>("mp_periodos_v2", []);
+  const { user, loading: authLoading, login, logout } = useAuth();
+  const uid = user?.uid ?? null;
+
+  const [config, setConfig, syncingConfig] = useFirestoreSync<Config>("config", DEFAULT_CONFIG, uid);
+  const [registros, setRegistros, syncingReg] = useFirestoreSync<Record<string,RegistroDia>>("registros", {}, uid);
+  const [financeiro, setFinanceiro] = useFirestoreSync<{recebimentos:Recebimento[]}>("financeiro", {recebimentos:[]}, uid);
+  const [ferias, setFerias] = useFirestoreSync<{historico:FeriasRegistro[]}>("ferias", {historico:[]}, uid);
+  const [periodos, setPeriodos] = useFirestoreSync<Periodo[]>("periodos", [], uid);
+  const syncing = syncingConfig || syncingReg;
+
   const [dark, setDark] = useState(true);
   const [aba, setAba] = useState("ponto"); // tela principal
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -3009,6 +3016,41 @@ export default function MeuPonto() {
     setDrawerOpen(false);
   }
 
+  // Tela de carregamento enquanto verifica auth
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center">
+        <div className="text-center">
+          <div className="w-14 h-14 bg-gradient-to-br from-blue-500 to-blue-700 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg shadow-blue-500/30">
+            <Ic n="clock" size={28} cls="text-white"/>
+          </div>
+          <p className="text-slate-400 text-sm">Carregando...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Tela de login
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center px-4">
+        <div className="w-full max-w-sm text-center">
+          <div className="w-20 h-20 bg-gradient-to-br from-blue-500 to-blue-700 rounded-3xl flex items-center justify-center mx-auto mb-6 shadow-2xl shadow-blue-500/30">
+            <Ic n="clock" size={36} cls="text-white"/>
+          </div>
+          <h1 className="text-3xl font-bold text-white mb-2">MeuPonto</h1>
+          <p className="text-slate-400 text-sm mb-10">Controle de ponto para trabalhadores CLT</p>
+          <button onClick={login}
+            className="w-full flex items-center justify-center gap-3 py-4 px-6 bg-white rounded-2xl text-slate-800 font-semibold text-base hover:bg-slate-100 active:scale-95 transition-all shadow-lg">
+            <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/><path fill="none" d="M0 0h48v48H0z"/></svg>
+            Entrar com Google
+          </button>
+          <p className="text-slate-600 text-xs mt-6">Seus dados ficam salvos na sua conta Google<br/>e sincronizados entre todos os dispositivos.</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={`min-h-screen transition-colors duration-300 ${dark?"bg-slate-900 text-white":"bg-slate-50 text-slate-900"}`}
       style={{fontFamily:"'Sora', system-ui, sans-serif"}}>
@@ -3035,12 +3077,22 @@ export default function MeuPonto() {
             <span className="font-bold text-base tracking-tight">{drawerLabel || "MeuPonto"}</span>
           </div>
           <div className="flex items-center gap-2">
+            {syncing && (
+              <span className="text-xs text-slate-500 animate-pulse">↕</span>
+            )}
             <button onClick={()=>setDark(!dark)} className={`p-2 rounded-xl transition-colors ${dark?"hover:bg-slate-700 text-slate-400":"hover:bg-slate-100 text-slate-500"}`}>
               <Ic n={dark?"sun":"moon"} size={18}/>
             </button>
-            <button onClick={()=>setDrawerOpen(true)} className={`p-2 rounded-xl transition-colors ${dark?"hover:bg-slate-700 text-slate-400":"hover:bg-slate-100 text-slate-500"}`}>
-              <Ic n="menu" size={20}/>
-            </button>
+            {user?.photoURL ? (
+              <button onClick={()=>setDrawerOpen(true)}
+                className="w-8 h-8 rounded-full overflow-hidden border-2 border-blue-500/40">
+                <img src={user.photoURL} alt={user.displayName||"Usuário"} className="w-full h-full object-cover"/>
+              </button>
+            ) : (
+              <button onClick={()=>setDrawerOpen(true)} className={`p-2 rounded-xl transition-colors ${dark?"hover:bg-slate-700 text-slate-400":"hover:bg-slate-100 text-slate-500"}`}>
+                <Ic n="menu" size={20}/>
+              </button>
+            )}
           </div>
         </div>
       </header>
@@ -3102,8 +3154,25 @@ export default function MeuPonto() {
                 </button>
               ))}
             </div>
-            {/* Rodapé do drawer — toggle de tema */}
+            {/* Rodapé do drawer */}
             <div className={`p-4 border-t space-y-3 ${dark?"border-slate-700":"border-slate-200"}`}>
+              {/* Info do usuário */}
+              {user && (
+                <div className={`flex items-center gap-3 px-2 py-2 rounded-xl ${dark?"bg-slate-700/40":"bg-slate-50"}`}>
+                  {user.photoURL ? (
+                    <img src={user.photoURL} alt="" className="w-8 h-8 rounded-full flex-shrink-0"/>
+                  ) : (
+                    <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center flex-shrink-0">
+                      <span className="text-white text-xs font-bold">{user.displayName?.[0]||"U"}</span>
+                    </div>
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <p className={`text-xs font-medium truncate ${dark?"text-white":"text-slate-800"}`}>{user.displayName||"Usuário"}</p>
+                    <p className="text-xs text-slate-500 truncate">{user.email}</p>
+                  </div>
+                </div>
+              )}
+              {/* Toggle tema */}
               <div className="flex items-center justify-between px-2">
                 <div className="flex items-center gap-2">
                   <Ic n={dark?"moon":"sun"} size={16} cls={dark?"text-blue-400":"text-yellow-400"}/>
@@ -3113,6 +3182,13 @@ export default function MeuPonto() {
                 </div>
                 <Toggle value={dark} onChange={setDark}/>
               </div>
+              {/* Sair */}
+              <button onClick={()=>{ logout(); setDrawerOpen(false); }}
+                className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-medium transition-all
+                  ${dark?"text-red-400 hover:bg-red-500/10":"text-red-500 hover:bg-red-50"}`}>
+                <Ic n="logout" size={16}/>
+                Sair da conta
+              </button>
               <p className="text-xs text-slate-500 text-center">MeuPonto v2.0</p>
             </div>
           </div>

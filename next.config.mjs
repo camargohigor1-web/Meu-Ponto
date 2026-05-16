@@ -8,6 +8,17 @@ const pwaConfig = withPWA({
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  async headers() {
+    return [
+      {
+        source: "/.well-known/assetlinks.json",
+        headers: [
+          { key: "Content-Type", value: "application/json" },
+          { key: "Cache-Control", value: "no-cache" },
+        ],
+      },
+    ];
+  },
 };
 
 export default pwaConfig(nextConfig);
