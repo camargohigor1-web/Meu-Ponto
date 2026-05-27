@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useAuth } from "@/lib/AuthContext";
 import { useFirestoreSync } from "@/lib/useFirestoreSync";
 import {
@@ -479,6 +479,44 @@ function urlBase64ToArrayBuffer(base64: string): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
 
+function notificacoesAtivas(config: Config): Notificacao[] {
+  return (config.notificacoes?.length ? config.notificacoes : DEFAULT_CONFIG.notificacoes).filter(n => n.ativa);
+}
+
+function buscarNotificacao(config: Config, termos: string[]): Notificacao | null {
+  const norm = (s: string) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  return notificacoesAtivas(config).find(n => {
+    const label = norm(n.label);
+    return termos.every(t => label.includes(norm(t)));
+  }) || null;
+}
+
+async function obterRegistroNotificacao(): Promise<ServiceWorkerRegistration | null> {
+  if (!("serviceWorker" in navigator)) return null;
+  const existente = await navigator.serviceWorker.getRegistration("/push/");
+  return existente || navigator.serviceWorker.register("/push-sw.js", { scope: "/push/" });
+}
+
+async function emitirNotificacaoLocal(title: string, body: string, tag: string) {
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  const options = {
+    body,
+    icon: "/icon-192.png",
+    badge: "/icon-192.png",
+    tag,
+    data: { url: "/?tela=ponto" },
+    vibrate: [200, 100, 200],
+  } as NotificationOptions & { vibrate: number[] };
+  try {
+    const reg = await obterRegistroNotificacao();
+    if (reg?.showNotification) {
+      await reg.showNotification(title, options);
+      return;
+    }
+  } catch {}
+  new Notification(title, options);
+}
+
 // ============================================================
 // TELA: PONTO
 // ============================================================
@@ -493,6 +531,7 @@ function TelaPonto({ config, registros, setRegistros, periodos, dark }: {
   const [editVal, setEditVal] = useState("");
   const [modoEdicao, setModoEdicao] = useState(false);
   const [showObs, setShowObs] = useState(false);
+  const notificacoesDisparadas = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     setHora(new Date());
@@ -556,6 +595,49 @@ function TelaPonto({ config, registros, setRegistros, periodos, dark }: {
     const agora = hora.getHours()*60 + hora.getMinutes() + hora.getSeconds()/60;
     return Math.ceil((fim - agora) * 60);
   })();
+
+  useEffect(() => {
+    if (!hora || !ehHoje) return;
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+
+    const agora = hora.getHours() * 60 + hora.getMinutes() + hora.getSeconds() / 60;
+    const tentarDisparar = (key: string, alvoMin: number, notif: Notificacao | null, titulo: string, mensagemPadrao: string) => {
+      if (!notif) return;
+      const antecedencia = Math.max(0, Number(notif.antecedencia) || 0);
+      const disparo = alvoMin - antecedencia;
+      const chave = `${diaAtual}:${key}:${alvoMin}:${antecedencia}`;
+      if (notificacoesDisparadas.current.has(chave)) return;
+      if (agora >= disparo && agora <= alvoMin) {
+        notificacoesDisparadas.current.add(chave);
+        const texto = notif.mensagem?.trim();
+        const body = texto
+          ? texto.replace(/\d+\s*minutos?/i, `${antecedencia} minutos`)
+          : mensagemPadrao.replace("{min}", String(antecedencia));
+        void emitirNotificacaoLocal(titulo, body, `meuponto-${key}-${diaAtual}`);
+      }
+    };
+
+    if (reg.batidas[1] && !reg.batidas[2]) {
+      const fimAlmoco = parseHHMM(reg.batidas[1]) + Math.max(0, Number(config.almocoDuracao) || 0);
+      tentarDisparar(
+        "fim-almoco",
+        fimAlmoco,
+        buscarNotificacao(config, ["volta", "almoco"]) || buscarNotificacao(config, ["almoco"]),
+        "Fim do almoço chegando",
+        "Faltam {min} minutos para voltar do almoço."
+      );
+    }
+
+    if (reg.batidas[2] && !reg.batidas[3]) {
+      tentarDisparar(
+        "fim-expediente",
+        parseHHMM(config.escala.saida),
+        buscarNotificacao(config, ["saida"]),
+        "Fim do expediente chegando",
+        "Faltam {min} minutos para encerrar o expediente."
+      );
+    }
+  }, [config, diaAtual, ehHoje, hora, reg.batidas]);
 
   const diaLabel = (() => {
     if (ehHoje) return "Hoje";
@@ -2454,9 +2536,18 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
   function salvar() { setConfig(rascunho); setEditando(false); }
   function cancelar() { setRascunho(config); setEditando(false); }
   const upd = (k: keyof Config, v: unknown) => setRascunho(p=>({...p,[k]:v}));
+  const notificacoesConfig = config.notificacoes?.length ? config.notificacoes : DEFAULT_CONFIG.notificacoes;
+  const atualizarNotif = (id: number, patch: Partial<Notificacao>) => {
+    setConfig(p => ({
+      ...p,
+      notificacoes: (p.notificacoes?.length ? p.notificacoes : DEFAULT_CONFIG.notificacoes).map(n =>
+        n.id === id ? { ...n, ...patch } : n
+      ),
+    }));
+  };
 
   useEffect(()=>{
-    if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+    if (!("serviceWorker" in navigator) || !("Notification" in window)) {
       setPushStatus("Indisponível neste navegador");
       return;
     }
@@ -2477,13 +2568,14 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
       setPushStatus(permission === "denied" ? "Bloqueado" : "Não ativado");
       return;
     }
+    const reg = await obterRegistroNotificacao();
+    setPushStatus("Permitido");
+
+    if (!("PushManager" in window) || !reg?.pushManager) return;
+
     const keyResponse = await fetch("/api/push/public-key");
     const { publicKey } = await keyResponse.json();
-    if (!publicKey) {
-      setPushStatus("VAPID não configurado");
-      return;
-    }
-    const reg = await navigator.serviceWorker.register("/push-sw.js", { scope: "/push/" });
+    if (!publicKey) return;
     const current = await reg.pushManager.getSubscription();
     const sub = current || await reg.pushManager.subscribe({
       userVisibleOnly: true,
@@ -2501,6 +2593,7 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
   async function testarPush() {
     if (!pushSubscription) {
       await ativarPush();
+      await emitirNotificacaoLocal("MeuPonto", "Teste de notificaÃ§Ã£o do MeuPonto.", "meuponto-teste");
       return;
     }
     const res = await fetch("/api/push/test", {
@@ -2705,9 +2798,9 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
           <Card cls={`p-4 border-blue-500/20 ${dark?"bg-blue-900/20":"bg-blue-50 border-blue-200"}`}>
             <div className="flex items-start justify-between gap-3">
               <div>
-                <p className={`text-sm font-semibold ${dark?"text-white":"text-slate-800"}`}>Web Push</p>
+                <p className={`text-sm font-semibold ${dark?"text-white":"text-slate-800"}`}>NotificaÃ§Ãµes</p>
                 <p className="text-xs text-slate-400 mt-0.5">Status: {pushStatus}</p>
-                <p className="text-xs text-slate-500 mt-1">Requer VAPID configurado no ambiente e armazenamento permanente para produção.</p>
+                <p className="text-xs text-slate-500 mt-1">Ative neste aparelho para receber os lembretes do almoço e da saída.</p>
               </div>
               <div className="flex flex-col gap-2">
                 <Btn onClick={ativarPush} sz="sm" v="secondary"><Ic n="bell" size={13}/>Ativar</Btn>
@@ -2715,17 +2808,29 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
               </div>
             </div>
           </Card>
-          {config.notificacoes.map(n=>(
+          {notificacoesConfig.map(n=>(
             <Card key={n.id} cls={`p-4 border-slate-700/50 ${dark?"bg-slate-800/50":"bg-white border-slate-200"}`}>
               <div className="flex items-start justify-between gap-2">
                 <div className="flex-1">
                   <p className={`text-sm font-medium ${dark?"text-white":"text-slate-700"}`}>{n.label}</p>
                   <p className="text-xs text-slate-400">{n.mensagem}</p>
+                  <label className="mt-3 flex items-center gap-2 text-xs text-slate-400">
+                    <span>AntecedÃªncia</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={240}
+                      value={n.antecedencia}
+                      onChange={e=>atualizarNotif(n.id, { antecedencia: Number(e.target.value) })}
+                      className={`w-16 rounded-lg border px-2 py-1 font-mono text-sm outline-none transition-colors ${dark?"bg-slate-900/60 border-slate-700 text-white focus:border-blue-500":"bg-white border-slate-300 text-slate-800 focus:border-blue-500"}`}
+                    />
+                    <span>min</span>
+                  </label>
                   <p className="text-xs text-blue-400 mt-0.5">⏰ {n.horario} · {n.antecedencia}min antes</p>
                 </div>
                 <div className="flex items-center gap-2">
-                  <Toggle value={n.ativa} onChange={v=>setConfig(p=>({...p,notificacoes:p.notificacoes.map(x=>x.id===n.id?{...x,ativa:v}:x)}))}/>
-                  <button onClick={()=>setConfig(p=>({...p,notificacoes:p.notificacoes.filter(x=>x.id!==n.id)}))} className="text-slate-500 hover:text-red-400 p-1">
+                  <Toggle value={n.ativa} onChange={v=>atualizarNotif(n.id, { ativa: v })}/>
+                  <button onClick={()=>setConfig(p=>({...p,notificacoes:(p.notificacoes?.length ? p.notificacoes : DEFAULT_CONFIG.notificacoes).filter(x=>x.id!==n.id)}))} className="text-slate-500 hover:text-red-400 p-1">
                     <Ic n="trash" size={14}/>
                   </button>
                 </div>
@@ -2745,7 +2850,7 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
                 <Inp label="Mensagem" value={novaNotif.mensagem} onChange={v=>setNovaNotif(p=>({...p,mensagem:v}))} placeholder="Ex: Hora do almoço!"/>
                 <div className="flex gap-3">
                   <Btn onClick={()=>{
-                    setConfig(p=>({...p,notificacoes:[...p.notificacoes,{...novaNotif,id:Date.now(),ativa:true}]}));
+                    setConfig(p=>({...p,notificacoes:[...(p.notificacoes?.length ? p.notificacoes : DEFAULT_CONFIG.notificacoes),{...novaNotif,id:Date.now(),ativa:true}]}));
                     setShowNovaNotif(false);
                     setNovaNotif({label:"",horario:"",antecedencia:5,mensagem:""});
                   }} cls="flex-1" v="success">Salvar</Btn>
