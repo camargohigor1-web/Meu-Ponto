@@ -1965,7 +1965,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
     y = 31;
 
     doc.setTextColor(30,30,30);
-    const cols = [M, 30, 46, 66, 88, 110, 130, 152, 190, 228];
+    const cols = [M, M+16, M+25, M+38, M+53, M+68, M+81, M+97, M+113, M+127];
     const headers = ["Data","Dia","Entrada","S.Almoço","V.Almoço","Saída","Extra Antes","Extra Depois","Extra Total","Obs"];
     doc.setFillColor(241,245,249);
     doc.rect(M-2, y-4, W-M*2+4, 7, "F");
@@ -2003,7 +2003,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
       doc.setFont("helvetica","bold");
       doc.text(ex ? minToHHMM(ex.extraTotal).replace("+","") : "—", cols[8], y);
       doc.setFont("helvetica","normal"); doc.setTextColor(30,30,30);
-      if (r.observacao) doc.text(r.observacao.slice(0,28), cols[9], y);
+      if (r.observacao) doc.text(r.observacao, cols[9], y);
       y += 6;
       if (y > 190) { doc.addPage(); y = 18; }
     });
