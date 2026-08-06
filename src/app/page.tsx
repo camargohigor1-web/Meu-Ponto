@@ -19,7 +19,7 @@ interface RegistroDia {
   observacao: string;
   rhDivergencias?: (string | null)[];
 }
-interface Periodo { id: string; inicio: string; fim: string; fechado: boolean; horaExtraRH?: string; }
+interface Periodo { id: string; inicio: string; fim: string; fechado: boolean; horaExtraRH?: string; horaExtraAntesRH?: string; horaExtraDepoisRH?: string; }
 interface Recebimento {
   id: number;
   dataRecebimento: string;
@@ -48,6 +48,7 @@ interface Config {
   nome: string; empresa: string; cargo: string; admissao: string; salarioBruto: string;
   escala: { dias: number[]; entrada: string; saidaAlmoco: string; voltaAlmoco: string; saida: string; };
   tolerancia: number; toleranciaTipo: "marcacao" | "dia";
+  toleranciaEntrada?: number; toleranciaAlmoco?: number; toleranciaSaida?: number; toleranciaDia?: number;
   almocoDuracao: number; fechamentoDia: number; pagamentoDia: number; adiantamentoDia: number;
   adicionalHE: number; darkMode: boolean;
   notificacoes: Notificacao[];
@@ -139,6 +140,7 @@ const DEFAULT_CONFIG: Config = {
   nome: "", empresa: "", cargo: "", admissao: "", salarioBruto: "",
   escala: { dias: [1,2,3,4,5], entrada: "08:00", saidaAlmoco: "12:00", voltaAlmoco: "13:00", saida: "17:00" },
   tolerancia: 5, toleranciaTipo: "marcacao", almocoDuracao: 60,
+  toleranciaEntrada: 5, toleranciaAlmoco: 5, toleranciaSaida: 5, toleranciaDia: 10,
   fechamentoDia: 25, pagamentoDia: 5, adiantamentoDia: 20, adicionalHE: 50, darkMode: true,
   descontoVT: "", descontoVA: "", descontoVR: "",
   descontoPlanoSaude: "", descontoPlanoOdonto: "",
@@ -216,29 +218,54 @@ function formatarData(s: string): string {
 function minutosPrevistos(config: Config): number {
   return Math.max(0, parseHHMM(config.escala.saida)-parseHHMM(config.escala.entrada)-Math.max(0, Number(config.almocoDuracao)||0));
 }
+function getTolerancias(config: Config) {
+  const fallback = Math.max(0, Number(config.tolerancia)||0);
+  return {
+    entrada: config.toleranciaEntrada ?? fallback,
+    almoco: config.toleranciaAlmoco ?? fallback,
+    saida: config.toleranciaSaida ?? fallback,
+    dia: config.toleranciaDia ?? Math.max(fallback, 10),
+  };
+}
+interface ExtrasDia {
+  extraAntes: number; extraDepois: number; extraTotal: number;
+  negativo: number; saldo: number; saldoBruto: number;
+}
+function calcExtrasDia(batidas: (string|null)[], config: Config): ExtrasDia | null {
+  const [e, sa, va, s] = batidas;
+  if (!e || !sa || !va || !s) return null;
+  const tol = getTolerancias(config);
+  const padEntrada = parseHHMM(config.escala.entrada);
+  const padSaida = parseHHMM(config.escala.saida);
+  const padVolta = parseHHMM(config.escala.voltaAlmoco);
+  const mEntrada = parseHHMM(e), mSaida = parseHHMM(s), mVolta = parseHHMM(va);
+
+  const antecipEntrada = Math.max(0, padEntrada - mEntrada);
+  const extraAntes = Math.max(0, antecipEntrada - tol.entrada);
+
+  const atrasoSaidaRaw = Math.max(0, mSaida - padSaida);
+  const extraDepois = Math.max(0, atrasoSaidaRaw - tol.saida);
+
+  const atrasoEntrada = Math.max(0, mEntrada - padEntrada);
+  const saidaAntecipada = Math.max(0, padSaida - mSaida);
+  const atrasoAlmocoRaw = Math.max(0, mVolta - padVolta);
+  const atrasoAlmoco = Math.max(0, atrasoAlmocoRaw - tol.almoco);
+
+  const negativoBruto = atrasoEntrada + saidaAntecipada + atrasoAlmoco;
+  const negativo = negativoBruto > tol.dia ? -negativoBruto : 0;
+
+  const extraTotal = extraAntes + extraDepois;
+  const saldoBruto = antecipEntrada + atrasoSaidaRaw - (atrasoEntrada + saidaAntecipada + atrasoAlmocoRaw);
+  return { extraAntes, extraDepois, extraTotal, negativo, saldo: extraTotal + negativo, saldoBruto };
+}
 function calcSaldoBruto(batidas: (string|null)[], config: Config): number | null {
-  const [e,sa,va,s] = batidas;
-  if (!e||!sa||!va||!s) return null;
-  const trab = (parseHHMM(s)-parseHHMM(va))+(parseHHMM(sa)-parseHHMM(e));
-  return trab - minutosPrevistos(config);
+  return calcExtrasDia(batidas, config)?.saldoBruto ?? null;
 }
 function calcSaldo(batidas: (string|null)[], config: Config): number | null {
-  const [e,sa,va,s] = batidas;
-  if (!e||!sa||!va||!s) return null;
-  const padroes = [config.escala.entrada, "", "", config.escala.saida];
-  const tolerancia = Math.max(0, Number(config.tolerancia)||0);
-  if (config.toleranciaTipo === "marcacao") {
-    const ajustadas = batidas.map((b,i) => {
-      if (!b) return b;
-      if (i === 1 || i === 2) return b;
-      const diff = parseHHMM(b) - parseHHMM(padroes[i]);
-      return Math.abs(diff) <= tolerancia ? padroes[i] : b;
-    });
-    return calcSaldoBruto(ajustadas, config);
-  }
-  const bruto = calcSaldoBruto(batidas, config);
-  if (bruto === null) return null;
-  return Math.abs(bruto) <= tolerancia ? 0 : bruto;
+  return calcExtrasDia(batidas, config)?.saldo ?? null;
+}
+function batidasEfetivas(r: RegistroDia): (string|null)[] {
+  return r.batidas.map((b,i) => r.rhDivergencias?.[i] ?? b);
 }
 function strParaData(s: string): Date {
   const [y,m,d] = s.split("-").map(Number);
@@ -288,19 +315,21 @@ function resumoRegistros(dias: string[], registros: Record<string,RegistroDia>, 
     }
     // Se tem ausência e é feriado/folga/férias — não conta negativamente
     if (!util && !r.ausencia) return acc;
-    const bruto = calcSaldoBruto(r.batidas, config);
-    const considerado = calcSaldo(r.batidas, config);
-    if (bruto !== null) acc.bruto += bruto;
-    if (considerado !== null) {
-      acc.considerado += considerado;
-      acc.extras += Math.max(0, considerado);
-      acc.negativas += Math.min(0, considerado);
+    const efetivas = batidasEfetivas(r);
+    const ex = calcExtrasDia(efetivas, config);
+    if (ex !== null) {
+      acc.bruto += ex.saldoBruto;
+      acc.considerado += ex.saldo;
+      acc.extras += ex.extraTotal;
+      acc.extrasAntes += ex.extraAntes;
+      acc.extrasDepois += ex.extraDepois;
+      acc.negativas += ex.negativo;
       acc.diasComPonto++;
     }
     if (r.ausencia === "falta") acc.faltas++;
     if (r.ausencia === "atestado") acc.atestados++;
     return acc;
-  }, {bruto:0, considerado:0, extras:0, negativas:0, faltas:0, atestados:0, diasComPonto:0});
+  }, {bruto:0, considerado:0, extras:0, extrasAntes:0, extrasDepois:0, negativas:0, faltas:0, atestados:0, diasComPonto:0});
 }
 // Conta dias úteis em um período (excluindo fins de semana e feriados)
 function contarDiasUteis(inicio: string, fim: string, config: Config, feriados: Record<string,string>): number {
@@ -337,6 +366,10 @@ function horasExtrasFinanceiras(periodos: Periodo[] = [], registros: Record<stri
   let total = 0;
   const fechados = periodos.filter(p=>p.fechado && (!inicio || p.fim >= inicio) && (!fim || p.inicio <= fim));
   fechados.forEach(p=>{
+    if (p.horaExtraAntesRH || p.horaExtraDepoisRH) {
+      total += Math.max(0, Number(p.horaExtraAntesRH)||0) * 60 + Math.max(0, Number(p.horaExtraDepoisRH)||0) * 60;
+      return;
+    }
     if (p.horaExtraRH) {
       total += Math.max(0, Number(p.horaExtraRH)||0) * 60;
       return;
@@ -545,7 +578,7 @@ function TelaPonto({ config, registros, setRegistros, periodos, dark }: {
   const voltaAlmocoPrevista = reg.batidas[1] ? minToHHMM(parseHHMM(reg.batidas[1]) + config.almocoDuracao).replace("+","") : "";
   const padroes = [config.escala.entrada, config.escala.saidaAlmoco, voltaAlmocoPrevista, config.escala.saida];
   const proxIdx = reg.batidas.findIndex(b=>!b);
-  const saldo = calcSaldo(reg.batidas, config);
+  const saldo = calcSaldo(batidasEfetivas(reg), config);
   const podeBater = ehHoje && (modoEdicao || ehHoje);
   const podeEditar = modoEdicao || ehHoje;
 
@@ -879,7 +912,7 @@ function TelaInicio({ config, registros, setRegistros, dark, abrirRelatorioPerio
   });
   const saldoSemana = diasSemana.reduce((acc,dia)=>{
     const r=registros[dia]; if(!r) return acc;
-    return acc+(calcSaldo(r.batidas, config)||0);
+    return acc+(calcSaldo(batidasEfetivas(r), config)||0);
   },0);
 
   const periodoAtual = periodoFechamento(hoje, config.fechamentoDia);
@@ -893,10 +926,10 @@ function TelaInicio({ config, registros, setRegistros, dark, abrirRelatorioPerio
   const mesAtual = periodoMes(new Date().getFullYear(), new Date().getMonth());
   const diasMesAtual = listarDias(mesAtual.inicio, mesAtual.fim, false);
   const diasUteisTotal = contarDiasUteis(mesAtual.inicio, hoje, config, feriadosPeriodo);
-  const diasMesComPonto = diasMesAtual.filter(d => d <= hoje && registros[d] && calcSaldo(registros[d].batidas, config) !== null).length;
+  const diasMesComPonto = diasMesAtual.filter(d => d <= hoje && registros[d] && calcSaldo(batidasEfetivas(registros[d]), config) !== null).length;
   const faltasMes = diasMesAtual.filter(d => d <= hoje && registros[d]?.ausencia === "falta").length;
   const heMinMes = diasMesAtual.filter(d => d <= hoje && registros[d]).reduce((acc,d)=>{
-    const s = calcSaldo(registros[d].batidas, config);
+    const s = calcSaldo(batidasEfetivas(registros[d]), config);
     return acc + (s !== null ? Math.max(0,s) : 0);
   }, 0);
   const valorHEMes = valorHoraExtra(heMinMes, config);
@@ -916,7 +949,7 @@ function TelaInicio({ config, registros, setRegistros, dark, abrirRelatorioPerio
     if(r.ausencia==="ferias") return {emoji:"🏖️",cor:""};
     if(r.ausencia==="falta") return {emoji:"❌",cor:"text-red-400"};
     if(r.ausencia==="feriado") return {emoji:"🔵",cor:"text-blue-400"};
-    if(calcSaldo(r.batidas, config)!==null) return {emoji:"✅",cor:"text-emerald-400"};
+    if(calcSaldo(batidasEfetivas(r), config)!==null) return {emoji:"✅",cor:"text-emerald-400"};
     return null;
   }
 
@@ -1021,7 +1054,7 @@ function TelaInicio({ config, registros, setRegistros, dark, abrirRelatorioPerio
               r?.ausencia==="falta" ? "bg-red-400" : "",
               r?.ausencia==="atestado" ? "bg-yellow-400" : "",
               r?.ausencia==="ferias" ? "bg-sky-300" : "",
-              r && calcSaldo(r.batidas, config)!==null ? "bg-emerald-400" : "",
+              r && calcSaldo(batidasEfetivas(r), config)!==null ? "bg-emerald-400" : "",
             ].filter(Boolean);
             return (
               <button key={i} onClick={()=>setDiaSel(str)}
@@ -1073,7 +1106,7 @@ function TelaInicio({ config, registros, setRegistros, dark, abrirRelatorioPerio
                 <>
                   {(() => {
                     const r = registros[diaSel];
-                    const s = r ? calcSaldo(r.batidas, config) : null;
+                    const s = r ? calcSaldo(batidasEfetivas(r), config) : null;
                     return (
                       <div className="space-y-3">
                         {/* Batidas */}
@@ -1377,7 +1410,7 @@ function TelaFinanceiro({ config, registros, financeiro, setFinanceiro, periodos
       const str=`${ano}-${String(mes+1).padStart(2,"0")}-${String(dd).padStart(2,"0")}`;
       if(!entreDatas(str, filtroInicio, filtroFim)) continue;
       const r=registros[str]; if(!r) continue;
-      saldo+=calcSaldo(r.batidas, config)||0;
+      saldo+=calcSaldo(batidasEfetivas(r), config)||0;
     }
     return {mes:MESES_CURTOS[mes], saldo:parseFloat((saldo/60).toFixed(1))};
   });
@@ -1800,7 +1833,8 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
   const [rhPeriodoId, setRhPeriodoId] = useState<string|null>(null);
   const [rhDia, setRhDia] = useState<string|null>(null);
   const [rhVals, setRhVals] = useState<(string|null)[]>([null,null,null,null]);
-  const [rhHoraExtra, setRhHoraExtra] = useState("");
+  const [rhHoraExtraAntes, setRhHoraExtraAntes] = useState("");
+  const [rhHoraExtraDepois, setRhHoraExtraDepois] = useState("");
   const [filtroInicio, setFiltroInicio] = useState(filtroInicial?.inicio || "");
   const [filtroFim, setFiltroFim] = useState(filtroInicial?.fim || "");
 
@@ -1830,7 +1864,10 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
 
   const renderResumoPeriodo = (dias: string[], periodo?: Periodo) => {
     const resumo = resumoRegistros(dias, registros, config);
-    const heMin = periodo?.horaExtraRH ? Math.round(Number(periodo.horaExtraRH)*60) : resumo.extras;
+    const temRHOverride = !!(periodo?.horaExtraAntesRH || periodo?.horaExtraDepoisRH || periodo?.horaExtraRH);
+    const heAntesMin = periodo?.horaExtraAntesRH ? Math.round(Number(periodo.horaExtraAntesRH)*60) : (periodo?.horaExtraRH ? 0 : resumo.extrasAntes);
+    const heDepoisMin = periodo?.horaExtraDepoisRH ? Math.round(Number(periodo.horaExtraDepoisRH)*60) : (periodo?.horaExtraRH ? Math.round(Number(periodo.horaExtraRH)*60) : resumo.extrasDepois);
+    const heMin = heAntesMin + heDepoisMin;
     const inicioResumo = dias[0] || periodo?.inicio || "";
     const fimResumo = dias[dias.length-1] || periodo?.fim || "";
     const bruto = financeiro.recebimentos
@@ -1851,7 +1888,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
             <p className={`font-mono font-bold text-sm ${item.c}`}>{item.v}</p>
           </div>
         ))}
-        {periodo?.horaExtraRH && <div className="col-span-2"><Badge color="yellow">Hora Extra RH aplicada</Badge></div>}
+        {temRHOverride && <div className="col-span-2"><Badge color="yellow">Hora Extra RH aplicada</Badge></div>}
       </div>
     );
   };
@@ -1876,7 +1913,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
     while(d<=fFim){
       const r=registros[d];
       if(r){
-        const s=calcSaldo(r.batidas, config);
+        const s=calcSaldo(batidasEfetivas(r), config);
         if(s!==null) totalMin+=s;
         if(r.ausencia==="falta") faltas++;
         if(r.ausencia==="atestado") atestados++;
@@ -1900,7 +1937,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
     const r=registros[rhDia]||{batidas:[null,null,null,null],editado:[false,false,false,false],ausencia:"",observacao:""};
     setRegistros(prev=>({...prev,[rhDia]:{...r,rhDivergencias:rhVals}}));
     if(rhPeriodoId) {
-      setPeriodos(prev=>prev.map(p=>p.id===rhPeriodoId?{...p,horaExtraRH:rhHoraExtra}:p));
+      setPeriodos(prev=>prev.map(p=>p.id===rhPeriodoId?{...p,horaExtraAntesRH:rhHoraExtraAntes,horaExtraDepoisRH:rhHoraExtraDepois}:p));
     }
     setRhDia(null); setRhVals([null,null,null,null]);
   }
@@ -1913,51 +1950,41 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
 
   async function gerarPDF(dias: string[], titulo: string) {
     const { jsPDF } = await import("jspdf");
-    const doc = new jsPDF({ orientation:"portrait", unit:"mm", format:"a4" });
-    const W = 210, M = 14;
-    let y = 18;
+    const doc = new jsPDF({ orientation:"landscape", unit:"mm", format:"a4" });
+    const W = 297, M = 12;
+    let y = 16;
 
-    // Header
     doc.setFillColor(30,64,175);
-    doc.rect(0,0,W,28,"F");
+    doc.rect(0,0,W,24,"F");
     doc.setTextColor(255,255,255);
-    doc.setFontSize(16); doc.setFont("helvetica","bold");
-    doc.text("MeuPonto · Espelho de Ponto", M, 11);
-    doc.setFontSize(9); doc.setFont("helvetica","normal");
-    doc.text(`${config.nome || "Funcionário"} · ${config.empresa || "Empresa"} · ${config.cargo || ""}`, M, 18);
-    doc.text(`Gerado em ${new Date().toLocaleDateString("pt-BR")}   Período: ${titulo}`, M, 24);
-    y = 35;
+    doc.setFontSize(15); doc.setFont("helvetica","bold");
+    doc.text("MeuPonto · Espelho de Ponto", M, 10);
+    doc.setFontSize(8.5); doc.setFont("helvetica","normal");
+    doc.text(`${config.nome || "Funcionário"} · ${config.empresa || "Empresa"} · ${config.cargo || ""}`, M, 16);
+    doc.text(`Gerado em ${new Date().toLocaleDateString("pt-BR")}   Período: ${titulo}`, M, 21);
+    y = 31;
 
-    // Dados funcionário
     doc.setTextColor(30,30,30);
-    doc.setFontSize(8); doc.setFont("helvetica","normal");
-    const admStr = config.admissao ? `Admissão: ${config.admissao.split("-").reverse().join("/")}` : "";
-    doc.text([`Salário Bruto: R$ ${Number(config.salarioBruto||0).toLocaleString("pt-BR",{minimumFractionDigits:2})}   ${admStr}`], M, y);
-    y += 7;
-
-    // Cabeçalho tabela
-    const cols = [M, 38, 56, 70, 84, 100, 118, 145, 170];
-    const headers = ["Data","Dia","Entrada","S.Almoço","V.Almoço","Saída","Saldo","Ocorrência","Obs"];
+    const cols = [M, 30, 46, 66, 88, 110, 130, 152, 190, 228, 262];
+    const headers = ["Data","Dia","Entrada","S.Almoço","V.Almoço","Saída","Extra Antes","Extra Depois","Extra Total","Ocorrência","Obs"];
     doc.setFillColor(241,245,249);
     doc.rect(M-2, y-4, W-M*2+4, 7, "F");
     doc.setFontSize(7.5); doc.setFont("helvetica","bold"); doc.setTextColor(80,80,80);
     headers.forEach((h,i) => doc.text(h, cols[i], y));
-    y += 5;
+    y += 5.5;
 
-    // Linhas
-    let totalExtras = 0, totalNeg = 0, diasComPonto = 0, faltas = 0;
+    let totalAntes = 0, totalDepois = 0, totalNeg = 0, diasComPonto = 0, faltas = 0;
     const diasSemana = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
     dias.forEach((dia, idx) => {
       const r = registros[dia];
       if (!r) return;
-      const [b0,b1,b2,b3] = r.batidas;
-      const saldo = calcSaldo(r.batidas, config);
-      if (saldo !== null) { diasComPonto++; if(saldo>=0) totalExtras+=saldo; else totalNeg+=saldo; }
+      const [b0,b1,b2,b3] = batidasEfetivas(r);
+      const ex = calcExtrasDia([b0,b1,b2,b3], config);
+      if (ex !== null) { diasComPonto++; totalAntes+=ex.extraAntes; totalDepois+=ex.extraDepois; totalNeg+=ex.negativo; }
       if (r.ausencia==="falta") faltas++;
       const dObj = strParaData(dia);
       const dSemana = diasSemana[dObj.getDay()];
       const dataFmt = dia.split("-").slice(1).reverse().join("/") + `/${dia.slice(2,4)}`;
-      const saldoStr = saldo !== null ? (saldo>=0?"+":"")+minToHHMM(saldo) : r.ausencia || "—";
 
       if (idx % 2 === 0) {
         doc.setFillColor(249,250,251);
@@ -1970,28 +1997,64 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
       doc.text(b1||"—", cols[3], y);
       doc.text(b2||"—", cols[4], y);
       doc.text(b3||"—", cols[5], y);
-      if (saldo !== null) {
-        doc.setTextColor(saldo>=0?22:220, saldo>=0?163:38, saldo>=0?74:38);
-      } else {
-        doc.setTextColor(150,100,0);
-      }
-      doc.text(saldoStr, cols[6], y);
-      doc.setTextColor(30,30,30);
-      doc.text(r.ausencia ? r.ausencia : "", cols[7], y);
-      if (r.observacao) doc.text(r.observacao.slice(0,20), cols[8], y);
+      doc.setTextColor(22,163,74);
+      doc.text(ex ? minToHHMM(ex.extraAntes).replace("+","") : "—", cols[6], y);
+      doc.text(ex ? minToHHMM(ex.extraDepois).replace("+","") : "—", cols[7], y);
+      doc.setFont("helvetica","bold");
+      doc.text(ex ? minToHHMM(ex.extraTotal).replace("+","") : "—", cols[8], y);
+      doc.setFont("helvetica","normal"); doc.setTextColor(30,30,30);
+      doc.text(r.ausencia ? r.ausencia : "", cols[9], y);
+      if (r.observacao) doc.text(r.observacao.slice(0,18), cols[10], y);
       y += 6;
-      if (y > 270) { doc.addPage(); y = 18; }
+      if (y > 190) { doc.addPage(); y = 18; }
     });
 
-    // Rodapé resumo
     y += 4;
     doc.setFillColor(30,64,175);
     doc.rect(M-2, y-4, W-M*2+4, 7, "F");
     doc.setTextColor(255,255,255); doc.setFont("helvetica","bold"); doc.setFontSize(8);
-    doc.text(`Dias com ponto: ${diasComPonto}   Faltas: ${faltas}   HE: +${minToHHMM(totalExtras)}   Negativo: ${minToHHMM(totalNeg)}   Saldo: ${minToHHMM(totalExtras+totalNeg)}`, M, y);
+    doc.text(`Dias com ponto: ${diasComPonto}   Faltas: ${faltas}   Extra antes: ${minToHHMM(totalAntes)}   Extra depois: ${minToHHMM(totalDepois)}   Extra total: ${minToHHMM(totalAntes+totalDepois)}   Negativo (tolerância do dia): ${minToHHMM(totalNeg)}`, M, y);
 
     doc.save(`espelho-ponto-${titulo.replace(/\s+/g,"-")}.pdf`);
   }
+
+  async function gerarExcel(dias: string[], titulo: string) {
+    const XLSX = await import("xlsx");
+    const diasSemana = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
+    const linhas: (string|number)[][] = [
+      ["MeuPonto · Espelho de Ponto"],
+      [`${config.nome || "Funcionário"} · ${config.empresa || "Empresa"} · ${config.cargo || ""}`],
+      [`Gerado em ${new Date().toLocaleDateString("pt-BR")}   Período: ${titulo}`],
+      [],
+      ["Data","Dia da Semana","Entrada","Saída Almoço","Retorno Almoço","Saída","Extra Antes da Entrada","Extra Após Saída","Extra Total no Dia","Ocorrência","Obs"],
+    ];
+    let totalAntes = 0, totalDepois = 0, totalNeg = 0, diasComPonto = 0, faltas = 0;
+    dias.forEach(dia => {
+      const r = registros[dia];
+      if (!r) return;
+      const [b0,b1,b2,b3] = batidasEfetivas(r);
+      const ex = calcExtrasDia([b0,b1,b2,b3], config);
+      if (ex !== null) { diasComPonto++; totalAntes+=ex.extraAntes; totalDepois+=ex.extraDepois; totalNeg+=ex.negativo; }
+      if (r.ausencia==="falta") faltas++;
+      const dObj = strParaData(dia);
+      const dataFmt = dia.split("-").slice(1).reverse().join("/") + `/${dia.slice(2,4)}`;
+      linhas.push([
+        dataFmt, diasSemana[dObj.getDay()], b0||"—", b1||"—", b2||"—", b3||"—",
+        ex ? minToHHMM(ex.extraAntes) : "—", ex ? minToHHMM(ex.extraDepois) : "—", ex ? minToHHMM(ex.extraTotal) : "—",
+        r.ausencia||"", r.observacao||""
+      ]);
+    });
+    linhas.push([]);
+    linhas.push(["Dias com ponto", diasComPonto, "Faltas", faltas, "Extra antes", minToHHMM(totalAntes), "Extra depois", minToHHMM(totalDepois), "Extra total", minToHHMM(totalAntes+totalDepois), "Negativo (tolerância do dia)", minToHHMM(totalNeg)] as unknown as (string|number)[]);
+
+    const ws = XLSX.utils.aoa_to_sheet(linhas);
+    ws["!cols"] = [{wch:10},{wch:8},{wch:9},{wch:11},{wch:12},{wch:9},{wch:12},{wch:12},{wch:12},{wch:12},{wch:20}];
+    ws["!pageSetup"] = { orientation: "landscape", fitToWidth: 1 } as unknown as never;
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Espelho de Ponto");
+    XLSX.writeFile(wb, `espelho-ponto-${titulo.replace(/\s+/g,"-")}.xlsx`);
+  }
+
 
   return (
     <div className="space-y-4 pb-6">
@@ -1999,6 +2062,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
         <h2 className={`text-xl font-bold ${dark?"text-white":"text-slate-800"}`}>Relatório</h2>
         <div className="flex gap-2">
           <Btn onClick={()=>{ const t=diasAbertos[0]&&diasAbertos[diasAbertos.length-1]?`${diasAbertos[0]}-a-${diasAbertos[diasAbertos.length-1]}`:"atual"; gerarPDF(diasAbertos, t); }} v="ghost" sz="sm"><Ic n="download" size={14}/>PDF</Btn>
+          <Btn onClick={()=>{ const t=diasAbertos[0]&&diasAbertos[diasAbertos.length-1]?`${diasAbertos[0]}-a-${diasAbertos[diasAbertos.length-1]}`:"atual"; gerarExcel(diasAbertos, t); }} v="ghost" sz="sm"><Ic n="download" size={14}/>Excel</Btn>
           <Btn onClick={()=>setShowFechar(true)} v="warning" sz="sm"><Ic n="lock" size={14}/>Fechar Período</Btn>
         </div>
       </div>
@@ -2033,7 +2097,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
               <p className="text-slate-400 text-sm text-center py-6">Nenhuma marcação no período aberto.</p>
             ) : diasAbertos.map(dia=>{
               const r=registros[dia];
-              const s=calcSaldo(r.batidas, config);
+              const s=calcSaldo(batidasEfetivas(r), config);
               return (
                 <div key={dia} className="p-3">
                   <div className="flex justify-between items-start">
@@ -2087,13 +2151,17 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
               <div className="p-4 space-y-3">
                 {renderResumoPeriodo(diasPeriodo, periodo)}
                 <div className="flex gap-2">
-                  <Inp label="Hora Extra RH" type="number" value={periodo.horaExtraRH||""} onChange={v=>setPeriodos(prev=>prev.map(p=>p.id===periodo.id?{...p,horaExtraRH:v}:p))} hint="Horas oficiais consideradas pelo RH"/>
-                  <Btn onClick={()=>reabrirPeriodo(periodo.id)} v="secondary" sz="sm" cls="self-end mb-5">Reabrir</Btn>
-                  <Btn onClick={()=>gerarPDF(diasPeriodo, `${periodo.inicio}-a-${periodo.fim}`)} v="ghost" sz="sm" cls="self-end mb-5"><Ic n="download" size={13}/>PDF</Btn>
+                  <Inp label="Extra Entrada RH (h)" type="number" value={periodo.horaExtraAntesRH||""} onChange={v=>setPeriodos(prev=>prev.map(p=>p.id===periodo.id?{...p,horaExtraAntesRH:v}:p))} hint="Horas extras antes, oficiais do RH"/>
+                  <Inp label="Extra Saída RH (h)" type="number" value={periodo.horaExtraDepoisRH||""} onChange={v=>setPeriodos(prev=>prev.map(p=>p.id===periodo.id?{...p,horaExtraDepoisRH:v}:p))} hint="Horas extras depois, oficiais do RH"/>
+                </div>
+                <div className="flex gap-2">
+                  <Btn onClick={()=>reabrirPeriodo(periodo.id)} v="secondary" sz="sm" cls="self-end mb-1">Reabrir</Btn>
+                  <Btn onClick={()=>gerarPDF(diasPeriodo, `${periodo.inicio}-a-${periodo.fim}`)} v="ghost" sz="sm" cls="self-end mb-1"><Ic n="download" size={13}/>PDF</Btn>
+                  <Btn onClick={()=>gerarExcel(diasPeriodo, `${periodo.inicio}-a-${periodo.fim}`)} v="ghost" sz="sm" cls="self-end mb-1"><Ic n="download" size={13}/>Excel</Btn>
                 </div>
                 {diasPeriodo.map(dia=>{
                   const r=registros[dia];
-                  const s=calcSaldo(r.batidas, config);
+                  const s=calcSaldo(batidasEfetivas(r), config);
                   const temRH=r.rhDivergencias?.some(v=>v);
                   return (
                     <div key={dia} className={`p-3 rounded-xl ${dark?"bg-slate-700/30":"bg-slate-100"}`}>
@@ -2101,7 +2169,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
                         <p className={`text-sm font-medium ${dark?"text-white":"text-slate-700"}`}>{formatarData(dia)}</p>
                         <div className="flex items-center gap-2">
                           {s!==null && <span className={`font-mono text-xs font-bold ${s>=0?"text-emerald-400":"text-red-400"}`}>{minToHHMM(s)}</span>}
-                          <button onClick={()=>{setRhDia(dia);setRhPeriodoId(periodo.id);setRhHoraExtra(periodo.horaExtraRH||"");setRhVals(r.rhDivergencias||[null,null,null,null]);}}
+                          <button onClick={()=>{setRhDia(dia);setRhPeriodoId(periodo.id);setRhHoraExtraAntes(periodo.horaExtraAntesRH||"");setRhHoraExtraDepois(periodo.horaExtraDepoisRH||"");setRhVals(r.rhDivergencias||[null,null,null,null]);}}
                             className={`text-xs px-2 py-1 rounded-lg border transition-all ${temRH?"border-yellow-500/30 text-yellow-400":"border-slate-600 text-slate-400 hover:text-white"}`}>
                             {temRH?"⚠️ RH":"+ RH"}
                           </button>
@@ -2155,8 +2223,22 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
               <button onClick={()=>setRhDia(null)} className="text-slate-400 hover:text-white"><Ic n="x" size={18}/></button>
             </div>
             <p className="text-xs text-slate-400">Insira apenas as marcações que divergem da folha do RH. Deixe em branco o que estiver correto.</p>
-            <Inp label="Hora Extra RH" type="number" value={rhHoraExtra} onChange={setRhHoraExtra} hint="Quantidade oficial de horas extras do período fechado"/>
+            <p className="text-xs text-slate-400">Insira apenas as marcações que divergem da folha do RH. Deixe em branco o que estiver correto. As horas extras do dia são recalculadas automaticamente com base nesses horários.</p>
+            <div className="flex gap-2">
+              <Inp label="Extra Entrada RH (h)" type="number" value={rhHoraExtraAntes} onChange={setRhHoraExtraAntes} hint="Oficial do período (opcional)"/>
+              <Inp label="Extra Saída RH (h)" type="number" value={rhHoraExtraDepois} onChange={setRhHoraExtraDepois} hint="Oficial do período (opcional)"/>
+            </div>
             <div className="space-y-3">
+              {(() => {
+                const base = registros[rhDia]?.batidas || [null,null,null,null];
+                const efetivas = base.map((b,i)=>rhVals[i] ?? b);
+                const ex = calcExtrasDia(efetivas, config);
+                return ex ? (
+                  <div className={`p-2 rounded-lg text-xs font-mono ${dark?"bg-slate-700/40 text-emerald-300":"bg-slate-100 text-emerald-700"}`}>
+                    Extra antes: {minToHHMM(ex.extraAntes)} · Extra depois: {minToHHMM(ex.extraDepois)} · Total: {minToHHMM(ex.extraTotal)}
+                  </div>
+                ) : null;
+              })()}
               {NOMES_BATIDAS.map((nome,i)=>{
                 const meu=registros[rhDia]?.batidas[i];
                 return (
@@ -2656,10 +2738,11 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
               </div>
               <Sel label="Adicional hora extra" value={rascunho.adicionalHE} onChange={v=>upd("adicionalHE",Number(v))}
                 opts={[{value:50,label:"50% (padrão CLT)"},{value:100,label:"100% (feriado)"}]}/>
-              <div className="flex gap-3">
-                <div className="flex-1"><Inp label="Tolerância (min)" type="number" value={rascunho.tolerancia} onChange={v=>upd("tolerancia",Number(v))}/></div>
-                <div className="flex-1"><Sel label="Tipo" value={rascunho.toleranciaTipo} onChange={v=>upd("toleranciaTipo",v as "marcacao"|"dia")}
-                  opts={[{value:"marcacao",label:"Por marcação"},{value:"dia",label:"Por dia"}]}/></div>
+              <div className="grid grid-cols-2 gap-3">
+                <Inp label="Tolerância entrada (min)" type="number" value={rascunho.toleranciaEntrada ?? 5} onChange={v=>upd("toleranciaEntrada",Number(v))} hint="Chegar antes disso gera hora extra"/>
+                <Inp label="Tolerância saída (min)" type="number" value={rascunho.toleranciaSaida ?? 5} onChange={v=>upd("toleranciaSaida",Number(v))} hint="Sair depois disso gera hora extra"/>
+                <Inp label="Tolerância almoço (min)" type="number" value={rascunho.toleranciaAlmoco ?? 5} onChange={v=>upd("toleranciaAlmoco",Number(v))} hint="Só perdoa atraso, não gera extra"/>
+                <Inp label="Tolerância do dia (min)" type="number" value={rascunho.toleranciaDia ?? 10} onChange={v=>upd("toleranciaDia",Number(v))} hint="Soma de atrasos/saídas antecipadas p/ virar saldo negativo"/>
               </div>
             </div>
           ) : (
@@ -2673,7 +2756,7 @@ function TelaConfig({ config, setConfig, dark, setDark }: {
                 <Campo label="Dia Pagamento" value={config.pagamentoDia?`Dia ${config.pagamentoDia}`:""}/>
                 <Campo label="Dia Adiantamento" value={config.adiantamentoDia?`Dia ${config.adiantamentoDia}`:""}/>
                 <Campo label="Adicional HE" value={`${config.adicionalHE}%`}/>
-                <Campo label="Tolerância" value={`${config.tolerancia}min (${config.toleranciaTipo==="marcacao"?"por marcação":"por dia"})`}/>
+                <Campo label="Tolerâncias" value={`Entrada ${getTolerancias(config).entrada}min · Almoço ${getTolerancias(config).almoco}min · Saída ${getTolerancias(config).saida}min · Dia ${getTolerancias(config).dia}min`}/>
               </div>
             </div>
           )}
