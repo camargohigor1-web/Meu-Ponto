@@ -241,10 +241,10 @@ function calcExtrasDia(batidas: (string|null)[], config: Config): ExtrasDia | nu
   const mEntrada = parseHHMM(e), mSaida = parseHHMM(s), mVolta = parseHHMM(va);
 
   const antecipEntrada = Math.max(0, padEntrada - mEntrada);
-  const extraAntes = Math.max(0, antecipEntrada - tol.entrada);
+  const extraAntes = antecipEntrada > tol.entrada ? antecipEntrada : 0;
 
   const atrasoSaidaRaw = Math.max(0, mSaida - padSaida);
-  const extraDepois = Math.max(0, atrasoSaidaRaw - tol.saida);
+  const extraDepois = atrasoSaidaRaw > tol.saida ? atrasoSaidaRaw : 0;
 
   const atrasoEntrada = Math.max(0, mEntrada - padEntrada);
   const saidaAntecipada = Math.max(0, padSaida - mSaida);
@@ -1965,8 +1965,8 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
     y = 31;
 
     doc.setTextColor(30,30,30);
-    const cols = [M, 30, 46, 66, 88, 110, 130, 152, 190, 228, 262];
-    const headers = ["Data","Dia","Entrada","S.Almoço","V.Almoço","Saída","Extra Antes","Extra Depois","Extra Total","Ocorrência","Obs"];
+    const cols = [M, 30, 46, 66, 88, 110, 130, 152, 190, 228];
+    const headers = ["Data","Dia","Entrada","S.Almoço","V.Almoço","Saída","Extra Antes","Extra Depois","Extra Total","Obs"];
     doc.setFillColor(241,245,249);
     doc.rect(M-2, y-4, W-M*2+4, 7, "F");
     doc.setFontSize(7.5); doc.setFont("helvetica","bold"); doc.setTextColor(80,80,80);
@@ -2003,8 +2003,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
       doc.setFont("helvetica","bold");
       doc.text(ex ? minToHHMM(ex.extraTotal).replace("+","") : "—", cols[8], y);
       doc.setFont("helvetica","normal"); doc.setTextColor(30,30,30);
-      doc.text(r.ausencia ? r.ausencia : "", cols[9], y);
-      if (r.observacao) doc.text(r.observacao.slice(0,18), cols[10], y);
+      if (r.observacao) doc.text(r.observacao.slice(0,28), cols[9], y);
       y += 6;
       if (y > 190) { doc.addPage(); y = 18; }
     });
@@ -2026,7 +2025,7 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
       [`${config.nome || "Funcionário"} · ${config.empresa || "Empresa"} · ${config.cargo || ""}`],
       [`Gerado em ${new Date().toLocaleDateString("pt-BR")}   Período: ${titulo}`],
       [],
-      ["Data","Dia da Semana","Entrada","Saída Almoço","Retorno Almoço","Saída","Extra Antes da Entrada","Extra Após Saída","Extra Total no Dia","Ocorrência","Obs"],
+      ["Data","Dia da Semana","Entrada","Saída Almoço","Retorno Almoço","Saída","Extra Antes da Entrada","Extra Após Saída","Extra Total no Dia","Obs"],
     ];
     let totalAntes = 0, totalDepois = 0, totalNeg = 0, diasComPonto = 0, faltas = 0;
     dias.forEach(dia => {
@@ -2041,14 +2040,14 @@ function TelaRelatorio({ config, registros, setRegistros, periodos, setPeriodos,
       linhas.push([
         dataFmt, diasSemana[dObj.getDay()], b0||"—", b1||"—", b2||"—", b3||"—",
         ex ? minToHHMM(ex.extraAntes) : "—", ex ? minToHHMM(ex.extraDepois) : "—", ex ? minToHHMM(ex.extraTotal) : "—",
-        r.ausencia||"", r.observacao||""
+        r.observacao||""
       ]);
     });
     linhas.push([]);
     linhas.push(["Dias com ponto", diasComPonto, "Faltas", faltas, "Extra antes", minToHHMM(totalAntes), "Extra depois", minToHHMM(totalDepois), "Extra total", minToHHMM(totalAntes+totalDepois), "Negativo (tolerância do dia)", minToHHMM(totalNeg)] as unknown as (string|number)[]);
 
     const ws = XLSX.utils.aoa_to_sheet(linhas);
-    ws["!cols"] = [{wch:10},{wch:8},{wch:9},{wch:11},{wch:12},{wch:9},{wch:12},{wch:12},{wch:12},{wch:12},{wch:20}];
+    ws["!cols"] = [{wch:10},{wch:8},{wch:9},{wch:11},{wch:12},{wch:9},{wch:15},{wch:14},{wch:14},{wch:24}];
     ws["!pageSetup"] = { orientation: "landscape", fitToWidth: 1 } as unknown as never;
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Espelho de Ponto");
